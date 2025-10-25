@@ -36,6 +36,33 @@ client.on('messageCreate', (message) => {
     }
 });
 
+// 👤 ブラックリスト対象のユーザー名（複数可）
+const BLACKLIST_USERS = ["harima1954"];
+
+// 🚫 禁止ワード（部分一致）
+const BLACKLIST_WORDS = ["大和", "死ね", "しね"];
+
+client.on("messageCreate", async (message) => {
+  // BotやDMには反応しない
+  if (message.author.bot || !message.guild) return;
+
+  const username = message.author.username;
+  const content = message.content;
+
+  // ブラックリスト条件チェック
+  const isBlacklistedUser = BLACKLIST_USERS.includes(username);
+  const containsBadWord = BLACKLIST_WORDS.some(word => content.includes(word));
+
+  if (isBlacklistedUser && containsBadWord) {
+    try {
+      await message.delete();
+      console.log(`🧹 ${username} の禁止メッセージを削除しました: ${content}`);
+    } catch (err) {
+      console.error("削除エラー:", err);
+    }
+    return;
+  }
+});
 // エラーハンドリング
 client.on('error', (error) => {
     console.error('❌ Discord クライアントエラー:', error);
