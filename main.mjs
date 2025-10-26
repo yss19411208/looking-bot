@@ -57,7 +57,8 @@ client.on("messageCreate", async (message) => {
 
   try {
     // Geminiに「悪質かどうか」を問い合わせる
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    const MODEL_ID = "gemini-2.5-flash";  // ドキュメント上で使えるモデル名の一例
+    const model = genAI.getGenerativeModel({ model: MODEL_ID });
     const prompt = `
 以下のメッセージが「攻撃的」「差別的」「脅迫的」「スパム」「不快」などの場合は「悪質」と判定してください。
 日本語で、"悪質" または "安全" のどちらかで答えてください。
