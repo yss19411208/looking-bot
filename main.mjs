@@ -1,7 +1,8 @@
 // main.mjs - Discord Botのメインプログラム
 
 // 必要なライブラリを読み込み
-import { Client, GatewayIntentBits } from 'discord.js';
+import { Client, GatewayIntentBits, PermissionsBitField } from "discord.js";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 import dotenv from 'dotenv';
 import express from 'express';
 
@@ -36,33 +37,58 @@ client.on('messageCreate', (message) => {
     }
 });
 
-// 👤 ブラックリスト対象のユーザー名（複数可）
-const BLACKLIST_USERS = ["harima1954"];
+const genAI = new GoogleGenerativeAI("AIzaSyB78DhMJ7RG44tK5-FO7X54CcbJ2j3p6TM");
 
-// 🚫 禁止ワード（部分一致）
-const BLACKLIST_WORDS = ["大和", "死ね", "しね"];
+// 👤 ホワイトリスト（AI判定をスキップ）
+const WHITELIST_USERS = ["ユーザー名1", "ユーザー名2"];
+
+// ⏱ タイムアウト時間（ミリ秒）
+// 例: 10分 → 10 * 60 * 1000
+const TIMEOUT_DURATION = 10 * 60 * 1000;
 
 client.on("messageCreate", async (message) => {
-  // BotやDMには反応しない
   if (message.author.bot || !message.guild) return;
 
   const username = message.author.username;
   const content = message.content;
 
-  // ブラックリスト条件チェック
-  const isBlacklistedUser = BLACKLIST_USERS.includes(username);
-  const containsBadWord = BLACKLIST_WORDS.some(word => content.includes(word));
+  // ホワイトリストはスキップ
+  if (WHITELIST_USERS.includes(username)) return;
 
-  if (isBlacklistedUser && containsBadWord) {
-    try {
-      await message.delete();
-      console.log(`🧹 ${username} の禁止メッセージを削除しました: ${content}`);
-    } catch (err) {
-      console.error("削除エラー:", err);
+  try {
+    // Geminiに「悪質かどうか」を問い合わせる
+    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    const prompt = `
+以下のメッセージが「攻撃的」「差別的」「脅迫的」「スパム」「不快」などの場合は「悪質」と判定してください。
+日本語で、"悪質" または "安全" のどちらかで答えてください。
+
+メッセージ: ${content}
+    `;
+
+    const result = await model.generateContent(prompt);
+    const response = result.response.text().trim();
+
+    console.log(`[Gemini判定] ${username}: ${response}`);
+
+    // Geminiが「悪質」と判定した場合のみ処理
+    if (response.includes("悪質")) {
+      const member = await message.guild.members.fetch(message.author.id);
+
+      // タイムアウト実行
+      await member.timeout(TIMEOUT_DURATION, "Geminiによる不適切メッセージ判定");
+
+      // メッセージの下に通知を送信
+      await message.reply(
+        `⚠️ **${username}** をタイムアウトしました（理由: 不適切な発言が検出されました）`
+      );
+
+      console.log(`⛔ ${username} をタイムアウトしました`);
     }
-    return;
+  } catch (err) {
+    console.error("Gemini判定またはタイムアウト時のエラー:", err);
   }
 });
+
 // エラーハンドリング
 client.on('error', (error) => {
     console.error('❌ Discord クライアントエラー:', error);
