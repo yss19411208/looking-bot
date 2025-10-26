@@ -1,7 +1,7 @@
 // main.mjs - Discord Botのメインプログラム
 
 // 必要なライブラリを読み込み
-import { Client, GatewayIntentBits, PermissionsBitField } from "discord.js";
+import { Client, GatewayIntentBits, SlashCommandBuilder, Routes, REST } from "discord.js";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import dotenv from 'dotenv';
 import express from 'express';
@@ -87,6 +87,51 @@ client.on("messageCreate", async (message) => {
     }
   } catch (err) {
     console.error("Gemini判定またはタイムアウト時のエラー:", err);
+  }
+});
+
+const TOKEN = process.env.DISCORD_TOKEN
+const CLIENT_ID = process.env.CLIENT_ID;
+
+const commands = [
+  new SlashCommandBuilder()
+    .setName("send")
+    .setDescription("指定したユーザーに秘密のメッセージを送る")
+    .addUserOption(option =>
+      option.setName("target").setDescription("メッセージを送る相手").setRequired(true)
+    )
+    .addStringOption(option =>
+      option.setName("message").setDescription("送る内容").setRequired(true)
+    ),
+].map(command => command.toJSON());
+
+// コマンド登録
+const rest = new REST({ version: "10" }).setToken(TOKEN);
+await rest.put(
+  Routes.applicationCommands(CLIENT_ID), // GUILD_IDを削除
+  { body: commands }
+);;
+
+client.on("interactionCreate", async interaction => {
+  if (!interaction.isChatInputCommand()) return;
+  if (interaction.commandName === "send") {
+    const target = interaction.options.getUser("target");
+    const message = interaction.options.getString("message");
+
+    try {
+      // DM送信
+      await target.send(`📩 **${interaction.user.tag}** からのメッセージ:\n${message}`);
+      await interaction.reply({
+        content: `✅ ${target.tag} にメッセージを送信しました（DMで）`,
+        ephemeral: true, // 実行者にしか見えない
+      });
+    } catch (err) {
+      console.error("DM送信エラー:", err);
+      await interaction.reply({
+        content: `❌ ${target.tag} にDMを送信できません（DM拒否設定かも）`,
+        ephemeral: true,
+      });
+    }
   }
 });
 
