@@ -37,7 +37,7 @@ client.on('messageCreate', (message) => {
     }
 });
 
-const genAI = new GoogleGenerativeAI("AIzaSyB78DhMJ7RG44tK5-FO7X54CcbJ2j3p6TM");
+const genAI = new GoogleGenerativeAI(process.env.AI_TOKEN);
 
 // 👤 ホワイトリスト（AI判定をスキップ）
 const WHITELIST_USERS = ["ユーザー名1", "ユーザー名2"];
