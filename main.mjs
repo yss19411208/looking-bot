@@ -176,5 +176,7 @@ app.get('/', (req, res) => {
 // サーバー起動
 app.listen(port, () => {
     console.log(`🌐 Web サーバーがポート ${port} で起動しました`);
-    console.log(process.env.AI_TOKEN)
+    console.log("AI_TOKEN =", process.env.AI_TOKEN);
+    console.log("DISCORD_TOKEN =", process.env.DISCORD_TOKEN);
+    console.log("CLIENT_ID =", process.env.CLIENT_ID);
 });
