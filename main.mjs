@@ -1,4 +1,4 @@
-// main.mjs - Discord Botのメインプログラム（AI判定強化版）
+// main.mjs - Discord Botのメインプログラム（誤判定防止版）
 
 import {
   Client,
@@ -12,10 +12,10 @@ import dotenv from "dotenv";
 import express from "express";
 import fetch from "node-fetch";
 
-// 環境変数を読み込み
+// .envファイルから環境変数を読み込み
 dotenv.config();
 
-// Discordクライアントを作成
+// Discord Botクライアントを作成
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -30,38 +30,40 @@ client.once("ready", () => {
   console.log(`📊 ${client.guilds.cache.size} つのサーバーに参加中`);
 });
 
-// Gemini初期化
+// Google Gemini AI 初期化
 const genAI = new GoogleGenerativeAI(process.env.AI_TOKEN);
 
-// 👤 ホワイトリスト（AI判定スキップ）
+// 👤 ホワイトリスト（AI判定をスキップ）
 const WHITELIST_USERS = ["harima1945"];
 
 // ⏱ タイムアウト時間（10分）
 const TIMEOUT_DURATION = 10 * 60 * 1000;
 
-// 🔍 Geminiに判定を依頼する関数（テキスト＋画像対応）
+// 🔍 Geminiに判定を依頼する関数（テキスト＋画像対応・誤判定防止版）
 async function judgeContent({ text = "", imageUrl = null }) {
   try {
     const model = genAI.getGenerativeModel({ model: "gemini-1.5-pro" });
 
-    // ---- 強化版プロンプト ----
     const prompt = `
 あなたはDiscordの安全管理AIです。
 次の内容（テキストおよび画像）を分析し、以下の基準で判定してください。
 
 【悪質とみなす条件】
-- 「死ね」「殺す」「消えろ」などの攻撃的・暴力的・侮辱的表現
+- 「死ね」「殺す」「消えろ」「バカ」「ゴミ」など攻撃的・侮辱的な発言
 - 差別、脅迫、性的、グロテスク、不快、スパム、犯罪助長など
-- 自殺・自傷・暴力・犯罪・テロ行為の示唆
-- 血液、死体、武器、性的・暴力的な画像、または危険な象徴を含む画像
+- 自殺・自傷・暴力・犯罪・テロ・武器・血液・死体など危険な描写
+- 性的・過激・暴力的な画像、または危険なシンボルを含む画像
 
 【安全とみなす条件】
-- 教育的・中立的・引用的な文脈であり、害意を含まないもの
-- 冗談・ゲーム内の軽い表現・明確に無害な内容
+- 日常的・一般的・ビジネス的・教育的な写真
+  （例：人がジャンプ・走る・笑う・話す・働く・旅行する）
+- 風景、建物、動物、食べ物など通常の画像
+- 教育・引用・中立的な表現で、害意や攻撃性がない内容
+- 軽い冗談、ゲーム内表現、ポジティブなコメントなど
 
 【出力ルール】
 - 必ず「悪質」または「安全」のどちらかのみを日本語で返す
-- 説明・理由・その他の文章は一切書かない
+- 説明文や理由は一切書かない
 `;
 
     const parts = [{ text: prompt }];
@@ -81,27 +83,27 @@ async function judgeContent({ text = "", imageUrl = null }) {
     const result = await model.generateContent(parts);
     const response = result.response.text().trim();
 
-    // 出力のバリデーション
+    // 出力が曖昧な場合は安全寄りに倒す
     if (!["悪質", "安全"].includes(response)) {
       console.warn("⚠️ 不明な判定を検出:", response);
-      return "悪質"; // 不明なときは安全側へ倒す
+      return "安全";
     }
 
     return response;
   } catch (err) {
     console.error("Gemini判定エラー:", err);
-    return "悪質"; // エラー時も安全側へ
+    return "安全"; // エラー時は安全寄りに扱う（誤BAN防止）
   }
 }
 
-// 💬 メッセージイベント
+// 💬 メッセージイベント処理
 client.on("messageCreate", async (message) => {
   if (message.author.bot || !message.guild) return;
 
   const username = message.author.username;
   const content = message.content;
 
-  // ホワイトリストユーザーは除外
+  // ホワイトリストユーザーはスキップ
   if (WHITELIST_USERS.includes(username)) return;
 
   const attachments = message.attachments;
@@ -112,7 +114,7 @@ client.on("messageCreate", async (message) => {
   try {
     let result;
 
-    // 🖼️ 画像＋テキスト判定
+    // 🖼️ 画像＋テキストを判定
     if (hasImage) {
       const imageUrl = attachments.first().url;
       result = await judgeContent({ text: content, imageUrl });
@@ -123,8 +125,8 @@ client.on("messageCreate", async (message) => {
       console.log(`[Geminiテキスト判定] ${username}: ${result}`);
     }
 
-    // 🚫 不適切ならタイムアウト
-    if (result.includes("悪質")) {
+    // 🚫 悪質判定の場合タイムアウト
+    if (result === "悪質") {
       const member = await message.guild.members.fetch(message.author.id);
       await member.timeout(TIMEOUT_DURATION, "Geminiによる不適切判定");
 
@@ -148,14 +150,20 @@ const commands = [
     .setName("send")
     .setDescription("指定したユーザーに秘密のメッセージを送る")
     .addUserOption((option) =>
-      option.setName("target").setDescription("メッセージを送る相手").setRequired(true)
+      option
+        .setName("target")
+        .setDescription("メッセージを送る相手")
+        .setRequired(true)
     )
     .addStringOption((option) =>
-      option.setName("message").setDescription("送る内容").setRequired(true)
+      option
+        .setName("message")
+        .setDescription("送る内容")
+        .setRequired(true)
     ),
 ].map((command) => command.toJSON());
 
-// Slashコマンド登録
+// コマンド登録
 const rest = new REST({ version: "10" }).setToken(TOKEN);
 await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
 
@@ -193,7 +201,7 @@ process.on("SIGINT", () => {
   process.exit(0);
 });
 
-// Discordログイン処理
+// Discordログイン
 if (!process.env.DISCORD_TOKEN) {
   console.error("❌ DISCORD_TOKEN が .env に設定されていません！");
   process.exit(1);
