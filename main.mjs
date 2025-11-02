@@ -40,7 +40,7 @@ client.on('messageCreate', (message) => {
 const genAI = new GoogleGenerativeAI(process.env.AI_TOKEN);
 
 // 👤 ホワイトリスト（AI判定をスキップ）
-const WHITELIST_USERS = ["ユーザー名1", "ユーザー名2"];
+const WHITELIST_USERS = ["harima1945"];
 
 // ⏱ タイムアウト時間（ミリ秒）
 // 例: 10分 → 10 * 60 * 1000
