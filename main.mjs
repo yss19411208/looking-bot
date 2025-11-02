@@ -9,8 +9,6 @@ import express from 'express';
 // .envファイルから環境変数を読み込み
 dotenv.config();
 
-console.log(process.env.AI_TOKEN)
-
 // Discord Botクライアントを作成
 const client = new Client({
     intents: [
@@ -178,4 +176,5 @@ app.get('/', (req, res) => {
 // サーバー起動
 app.listen(port, () => {
     console.log(`🌐 Web サーバーがポート ${port} で起動しました`);
+    console.log(process.env.AI_TOKEN)
 });
