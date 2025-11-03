@@ -44,47 +44,53 @@ const WHITELIST_USERS = ["harima1945"];
 // ⏱ タイムアウト時間（ミリ秒）
 const TIMEOUT_DURATION = 10 * 60 * 1000;
 
-// ⏱ API タイムアウト時間（60秒に延長）
-const API_TIMEOUT = 60000;
+// ⏱ API タイムアウト時間（30秒）
+const API_TIMEOUT = 30000;
 
 // 🚦 レート制限管理
-const rateLimitQueue = [];
-let isProcessing = false;
 let lastRequestTime = 0;
-const MIN_REQUEST_INTERVAL = 6000; // 各リクエスト間隔を6秒に延長
-const MAX_RETRIES = 5; // 最大リトライ回数を5回に増加
+const MIN_REQUEST_INTERVAL = 5000; // 各リクエスト間隔を5秒に延長（429エラー防止）
+let requestQueue = Promise.resolve(); // リクエストを順番に処理するためのキュー
 
-// 🔄 リトライ付きでAPIを呼び出す
-async function callWithRetry(apiFunc, retries = MAX_RETRIES) {
-    for (let i = 0; i < retries; i++) {
-        try {
-            // レート制限: 前回のリクエストから十分な時間が経過するまで待機
-            const now = Date.now();
-            const timeSinceLastRequest = now - lastRequestTime;
-            if (timeSinceLastRequest < MIN_REQUEST_INTERVAL) {
-                const waitTime = MIN_REQUEST_INTERVAL - timeSinceLastRequest;
-                console.log(`[レート制限] ${waitTime}ms 待機中...`);
-                await new Promise(resolve => setTimeout(resolve, waitTime));
-            }
-            
-            lastRequestTime = Date.now();
-            const result = await apiFunc();
-            return result;
-        } catch (err) {
-            if (err.message.includes('429') || err.message.includes('Resource exhausted')) {
-                const waitTime = Math.pow(2, i) * 5000; // 指数バックオフ: 5秒, 10秒, 20秒, 40秒, 80秒
-                console.log(`[429エラー] ${waitTime/1000}秒後にリトライ (${i + 1}/${retries})`);
-                if (i < retries - 1) {
-                    await new Promise(resolve => setTimeout(resolve, waitTime));
-                } else {
-                    console.error(`[レート制限] 最大リトライ回数に達しました。この判定をスキップします。`);
-                    throw new Error('レート制限: リトライ回数超過');
+// 🔄 レート制限を考慮したAPI呼び出し（必ず結果が出るまでリトライ）
+async function callAPI(apiFunc) {
+    // リクエストをキューに追加して順番に処理
+    return new Promise((resolve) => {
+        requestQueue = requestQueue.then(async () => {
+            let attempt = 0;
+            while (true) {
+                attempt++;
+                try {
+                    // レート制限: 前回のリクエストから十分な時間が経過するまで待機
+                    const now = Date.now();
+                    const timeSinceLastRequest = now - lastRequestTime;
+                    if (timeSinceLastRequest < MIN_REQUEST_INTERVAL) {
+                        const waitTime = MIN_REQUEST_INTERVAL - timeSinceLastRequest;
+                        console.log(`[レート制限] ${waitTime}ms 待機中...`);
+                        await new Promise(res => setTimeout(res, waitTime));
+                    }
+                    
+                    lastRequestTime = Date.now();
+                    const result = await apiFunc();
+                    console.log(`✅ API呼び出し成功 (試行回数: ${attempt})`);
+                    resolve(result);
+                    return; // 成功したのでループを抜ける
+                } catch (err) {
+                    if (err.message.includes('429') || err.message.includes('Resource exhausted')) {
+                        const waitTime = Math.min(5000 * attempt, 30000); // 5秒, 10秒, 15秒... 最大30秒
+                        console.log(`⚠️ 429エラー発生 (試行回数: ${attempt}): ${waitTime/1000}秒待機してから再実行します...`);
+                        await new Promise(res => setTimeout(res, waitTime));
+                        // ループを続けて再実行
+                    } else {
+                        console.error(`[APIエラー]:`, err.message);
+                        // 429以外のエラーの場合は5秒待ってリトライ
+                        console.log(`⚠️ エラー発生: 5秒待機してから再実行します...`);
+                        await new Promise(res => setTimeout(res, 5000));
+                    }
                 }
-            } else {
-                throw err;
             }
-        }
-    }
+        });
+    });
 }
 
 // 🖼️ 画像をBase64に変換する関数
@@ -126,7 +132,7 @@ async function checkTextContent(content) {
 
 メッセージ: ${content}`;
 
-        const result = await callWithRetry(async () => {
+        const result = await callAPI(async () => {
             const timeoutPromise = new Promise((_, reject) => 
                 setTimeout(() => reject(new Error('テキスト判定タイムアウト')), API_TIMEOUT)
             );
@@ -141,11 +147,8 @@ async function checkTextContent(content) {
         return response.includes("悪質");
     } catch (err) {
         console.error("[テキスト判定エラー]:", err.message);
-        // レート制限エラーの場合は警告を出すが、処理は継続
-        if (err.message.includes('レート制限')) {
-            console.log(`⚠️ テキスト判定をスキップしました（レート制限）`);
-        }
-        return false; // エラー時は安全側に倒して false を返す
+        // エラーが発生しても callAPI が無限リトライするので、ここには到達しないはず
+        return false;
     }
 }
 
@@ -171,7 +174,7 @@ async function checkImageContent(imageData) {
 
 日本語で、"悪質" または "安全" のどちらか一言だけで答えてください。`;
 
-        const result = await callWithRetry(async () => {
+        const result = await callAPI(async () => {
             const timeoutPromise = new Promise((_, reject) => 
                 setTimeout(() => reject(new Error('画像判定タイムアウト')), API_TIMEOUT)
             );
@@ -186,11 +189,8 @@ async function checkImageContent(imageData) {
         return response.includes("悪質");
     } catch (err) {
         console.error("[画像判定エラー]:", err.message);
-        // レート制限エラーの場合は警告を出すが、処理は継続
-        if (err.message.includes('レート制限')) {
-            console.log(`⚠️ 画像判定をスキップしました（レート制限）`);
-        }
-        return false; // エラー時は安全側に倒して false を返す
+        // エラーが発生しても callAPI が無限リトライするので、ここには到達しないはず
+        return false;
     }
 }
 
