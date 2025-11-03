@@ -313,6 +313,32 @@ client.on("interactionCreate", async interaction => {
     }
 });
 
+// 💬 Discordログ送信チャンネル設定
+const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID; // .env に追加しておく
+
+// console.log を上書きして Discord に送信
+const originalLog = console.log;
+console.log = async (...args) => {
+    const text = args.map(a => (typeof a === "object" ? JSON.stringify(a, null, 2) : a)).join(" ");
+    originalLog.apply(console, args); // 元のコンソール出力も保持
+    
+    try {
+        if (client && client.isReady() && LOG_CHANNEL_ID) {
+            const channel = await client.channels.fetch(LOG_CHANNEL_ID);
+            if (channel && channel.isTextBased()) {
+                // Discordのメッセージ上限は2000文字
+                if (text.length > 1900) {
+                    await channel.send("ログが長すぎるため一部省略:\n" + text.slice(0, 1900));
+                } else {
+                    await channel.send(text);
+                }
+            }
+        }
+    } catch (err) {
+        originalLog("⚠️ ログ送信エラー:", err.message);
+    }
+};
+
 client.on('error', (error) => {
     console.error('❌ Discord クライアントエラー:', error);
 });
