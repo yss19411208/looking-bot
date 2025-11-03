@@ -44,15 +44,15 @@ const WHITELIST_USERS = ["harima1945"];
 // ⏱ タイムアウト時間（ミリ秒）
 const TIMEOUT_DURATION = 10 * 60 * 1000;
 
-// ⏱ API タイムアウト時間（30秒）
-const API_TIMEOUT = 30000;
+// ⏱ API タイムアウト時間（60秒に延長）
+const API_TIMEOUT = 60000;
 
 // 🚦 レート制限管理
 const rateLimitQueue = [];
 let isProcessing = false;
 let lastRequestTime = 0;
-const MIN_REQUEST_INTERVAL = 2000; // 各リクエスト間隔を2秒に設定
-const MAX_RETRIES = 3; // 最大リトライ回数
+const MIN_REQUEST_INTERVAL = 6000; // 各リクエスト間隔を6秒に延長
+const MAX_RETRIES = 5; // 最大リトライ回数を5回に増加
 
 // 🔄 リトライ付きでAPIを呼び出す
 async function callWithRetry(apiFunc, retries = MAX_RETRIES) {
@@ -72,11 +72,12 @@ async function callWithRetry(apiFunc, retries = MAX_RETRIES) {
             return result;
         } catch (err) {
             if (err.message.includes('429') || err.message.includes('Resource exhausted')) {
-                const waitTime = Math.pow(2, i) * 3000; // 指数バックオフ: 3秒, 6秒, 12秒
+                const waitTime = Math.pow(2, i) * 5000; // 指数バックオフ: 5秒, 10秒, 20秒, 40秒, 80秒
                 console.log(`[429エラー] ${waitTime/1000}秒後にリトライ (${i + 1}/${retries})`);
                 if (i < retries - 1) {
                     await new Promise(resolve => setTimeout(resolve, waitTime));
                 } else {
+                    console.error(`[レート制限] 最大リトライ回数に達しました。この判定をスキップします。`);
                     throw new Error('レート制限: リトライ回数超過');
                 }
             } else {
@@ -140,7 +141,11 @@ async function checkTextContent(content) {
         return response.includes("悪質");
     } catch (err) {
         console.error("[テキスト判定エラー]:", err.message);
-        return false;
+        // レート制限エラーの場合は警告を出すが、処理は継続
+        if (err.message.includes('レート制限')) {
+            console.log(`⚠️ テキスト判定をスキップしました（レート制限）`);
+        }
+        return false; // エラー時は安全側に倒して false を返す
     }
 }
 
@@ -151,14 +156,20 @@ async function checkImageContent(imageData) {
         const MODEL_ID = "gemini-2.5-flash"; // 正しいモデル名
         const model = genAI.getGenerativeModel({ model: MODEL_ID });
         
-        const prompt = `この画像が以下のいずれかに該当する場合は「悪質」と判定してください:
-- 暴力的な内容
+        const prompt = `この画像を詳しく分析してください。
+
+【重要】画像内に文字やテキストが含まれている場合は、必ずその内容も確認してください。
+
+以下のいずれかに該当する場合は「悪質」と判定してください:
+- 暴力的な内容や暴力を助長する表現
 - 性的に露骨な内容
 - ヘイトスピーチや差別的な内容
 - グロテスクな内容
+- 攻撃的な言葉や脅迫的な言葉（「死ね」「殺す」など）が含まれている
+- 誰かを傷つける意図がある内容
 - その他不適切な内容
 
-日本語で、"悪質" または "安全" のどちらかで答えてください。`;
+日本語で、"悪質" または "安全" のどちらか一言だけで答えてください。`;
 
         const result = await callWithRetry(async () => {
             const timeoutPromise = new Promise((_, reject) => 
@@ -175,7 +186,11 @@ async function checkImageContent(imageData) {
         return response.includes("悪質");
     } catch (err) {
         console.error("[画像判定エラー]:", err.message);
-        return false;
+        // レート制限エラーの場合は警告を出すが、処理は継続
+        if (err.message.includes('レート制限')) {
+            console.log(`⚠️ 画像判定をスキップしました（レート制限）`);
+        }
+        return false; // エラー時は安全側に倒して false を返す
     }
 }
 
