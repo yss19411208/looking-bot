@@ -37,15 +37,6 @@ const MIN_REQUEST_INTERVAL = 5000;
 let lastRequestTime = 0;
 let requestQueue = Promise.resolve();
 
-// ✅ ログ送信先チャンネルID
-const LOG_CHANNEL_ID = "あなたのチャンネルIDをここに"; // ←★ここにDiscordログ用チャンネルIDを記入
-
-async function sendLog(content) {
-  console.log(content);
-  const channel = await client.channels.fetch(LOG_CHANNEL_ID).catch(() => null);
-  if (channel) channel.send(`🪵 **LOG:** ${content}`).catch(() => {});
-}
-
 // レート制限対応API呼び出し
 async function callAPI(apiFunc) {
   return new Promise((resolve) => {
@@ -226,6 +217,37 @@ client.on("interactionCreate", async (interaction) => {
     }
   }
 });
+
+// ログを送信するチャンネルIDを指定
+const LOG_CHANNEL_ID = process.env.CHANNEL_ID; // ←★ここを実際のログチャンネルIDに変更
+
+// 元の console.log を退避
+const originalLog = console.log;
+
+// 上書き
+console.log = async function (...args) {
+  const message = args.map((a) => (typeof a === "string" ? a : JSON.stringify(a, null, 2))).join(" ");
+
+  // 標準出力に出す（コンソールにも残す）
+  originalLog.apply(console, args);
+
+  // Discordに送信
+  if (client && client.readyAt && LOG_CHANNEL_ID) {
+    try {
+      const channel = await client.channels.fetch(LOG_CHANNEL_ID);
+      if (channel && channel.isTextBased()) {
+        // Discordの制限: メッセージは2000文字以内
+        if (message.length > 1900) {
+          await channel.send("**長すぎるログを省略しました:**\n" + message.slice(0, 1900));
+        } else {
+          await channel.send("**Log:** " + message);
+        }
+      }
+    } catch (err) {
+      originalLog("❌ ログ送信失敗:", err.message);
+    }
+  }
+};
 
 client.on("error", (err) => console.error("❌ Discordクライアントエラー:", err));
 
