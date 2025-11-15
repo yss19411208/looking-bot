@@ -1,6 +1,12 @@
-// main.mjs - Discord Bot（レート制限・GIF対応・/toコマンド対応）
+// main.mjs（自然なレインボー対応版）
 
-import { Client, GatewayIntentBits, SlashCommandBuilder, Routes, REST } from "discord.js";
+import {
+  Client,
+  GatewayIntentBits,
+  SlashCommandBuilder,
+  Routes,
+  REST,
+} from "discord.js";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import dotenv from "dotenv";
 import express from "express";
@@ -20,25 +26,18 @@ const client = new Client({
 client.once("ready", () => {
   console.log(`🎉 ${client.user.tag} が起動しました！`);
 });
+// =============================
+// 🧠 以下は元のGemini監視部分
+// =============================
 
-// Gemini初期化
 const genAI = new GoogleGenerativeAI(process.env.AI_TOKEN);
-
-// 🔒 ホワイトリスト
 const WHITELIST_USERS = ["harima1945"];
-
-// タイムアウト時間
-const TIMEOUT_DURATION = 10 * 60 * 1000;
-
-// API設定
+const TIMEOUT_DURATION = 30 * 60 * 1000;
 const API_TIMEOUT = 30000;
 const MIN_REQUEST_INTERVAL = 5000;
-
 let lastRequestTime = 0;
 let requestQueue = Promise.resolve();
-
-// ✅ ログ送信先チャンネルID
-const LOG_CHANNEL_ID = process.env.CHANNEL_ID; // ←★ここにDiscordログ用チャンネルIDを記入
+const LOG_CHANNEL_ID = process.env.CHANNEL_ID;
 
 async function sendLog(content) {
   console.log(content);
@@ -46,7 +45,6 @@ async function sendLog(content) {
   if (channel) channel.send(`**LOG:** ${content}`).catch(() => {});
 }
 
-// レート制限対応API呼び出し
 async function callAPI(apiFunc) {
   return new Promise((resolve) => {
     requestQueue = requestQueue.then(async () => {
@@ -78,7 +76,6 @@ async function callAPI(apiFunc) {
   });
 }
 
-// 🖼️ 画像をBase64化（GIFは除外）
 async function fetchImageAsBase64(url) {
   try {
     const response = await fetch(url, { timeout: 10000 });
@@ -99,7 +96,6 @@ async function fetchImageAsBase64(url) {
   }
 }
 
-// テキスト判定
 async function checkTextContent(content) {
   try {
     const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
@@ -121,7 +117,6 @@ async function checkTextContent(content) {
   }
 }
 
-// 画像判定
 async function checkImageContent(imageData) {
   try {
     const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
@@ -143,12 +138,10 @@ async function checkImageContent(imageData) {
   }
 }
 
-// 🧠 メッセージ判定
 client.on("messageCreate", async (message) => {
   if (message.author.bot || !message.guild) return;
   const username = message.author.username;
   const content = message.content;
-
   if (WHITELIST_USERS.includes(username)) return;
 
   let isMalicious = false;
@@ -180,65 +173,6 @@ client.on("messageCreate", async (message) => {
     await sendLog(`⛔ ${username} タイムアウト: ${reason}`);
   }
 });
-
-// === スラッシュコマンド設定 ===
-const TOKEN = process.env.DISCORD_TOKEN;
-const CLIENT_ID = process.env.CLIENT_ID;
-
-const commands = [
-  new SlashCommandBuilder()
-    .setName("to")
-    .setDescription("現在タイムアウト中のユーザー一覧を表示"),
-].map((cmd) => cmd.toJSON());
-
-const rest = new REST({ version: "10" }).setToken(TOKEN);
-await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
-
-// /to コマンド（全体に見える形）
-client.on("interactionCreate", async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
-  if (interaction.commandName === "to") {
-    await interaction.deferReply({ ephemeral: false }); // ←全体に見せる設定
-    try {
-      const guild = interaction.guild;
-      const members = await guild.members.fetch();
-      const timeoutUsers = members.filter(
-        (m) => m.communicationDisabledUntilTimestamp && m.communicationDisabledUntilTimestamp > Date.now()
-      );
-
-      if (timeoutUsers.size === 0) {
-        await interaction.editReply("✅ 現在タイムアウト中のユーザーはいません。");
-      } else {
-        const list = timeoutUsers
-          .map(
-            (m) =>
-              `• **${m.user.tag}**（残り約 ${((
-                (m.communicationDisabledUntilTimestamp - Date.now()) /
-                60000
-              ).toFixed(1))} 分）`
-          )
-          .join("\n");
-        await interaction.editReply(`⏱ **現在タイムアウト中のユーザー一覧:**\n${list}`);
-      }
-    } catch (err) {
-      console.error(err);
-      await interaction.editReply("❌ タイムアウト情報の取得中にエラーが発生しました。");
-    }
-  }
-});
-
-client.on("error", (err) => console.error("❌ Discordクライアントエラー:", err));
-
-process.on("SIGINT", () => {
-  console.log("🛑 Bot終了中...");
-  client.destroy();
-  process.exit(0);
-});
-
-if (!process.env.DISCORD_TOKEN) {
-  console.error("❌ DISCORD_TOKEN が設定されていません！");
-  process.exit(1);
-}
 
 console.log("🔄 Discordに接続中...");
 client.login(process.env.DISCORD_TOKEN);
