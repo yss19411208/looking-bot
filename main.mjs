@@ -1,5 +1,4 @@
-// main.mjs（完全版）
-
+// main.mjs
 import {
   Client,
   GatewayIntentBits,
@@ -8,16 +7,16 @@ import {
   REST,
   PermissionFlagsBits,
 } from "discord.js";
-import { GoogleGenerativeAI } from "@google-generative-ai";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 import dotenv from "dotenv";
 import express from "express";
 import fetch from "node-fetch";
 
 dotenv.config();
 
-// ==============================
-// 🔧 Discord クライアント
-// ==============================
+// ====================================
+// Discord クライアント
+// ====================================
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -27,97 +26,91 @@ const client = new Client({
   ],
 });
 
-// ==============================
-// 📌 ログ送信用
-// ==============================
-const LOG_CHANNEL_ID = process.env.CHANNEL_ID;
-async function sendLog(msg) {
-  console.log(msg);
-  try {
-    const ch = await client.channels.fetch(LOG_CHANNEL_ID);
-    ch?.send(`📘 **LOG:**\n${msg}`);
-  } catch {}
-}
-
-// console.log を完全に上書きして Discord に送信
+// ====================================
+// LOG用チャンネルへ console 出力を送信
+// （無限ループを防ぐため、log→送信→log しない）
+// ====================================
 const originalLog = console.log;
-console.log = function (...args) {
-  originalLog(...args);
-  sendLog(args.join(" "));
+console.log = (...args) => {
+  originalLog(...args); // ローカルには出す
+
+  const text = args.join(" ");
+  const chId = process.env.CHANNEL_ID;
+  if (!client.isReady() || !chId) return;
+
+  const ch = client.channels.cache.get(chId);
+  if (ch && ch.send) {
+    ch.send("**LOG:** " + text).catch(() => {});
+  }
 };
 
-// ==============================
-// 🧠 Gemini（AI強化版）
-// ==============================
+// ====================================
+// AIモデル
+// ====================================
 const genAI = new GoogleGenerativeAI(process.env.AI_TOKEN);
 
-async function aiJudgeText(content) {
-  const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+const WHITELIST_USERS = ["harima1945"];
+const TIMEOUT_DURATION = 30 * 60 * 1000;
+const API_TIMEOUT = 30000;
 
-  const prompt = `
-次のテキストを「1〜5」で不適切度を採点してください。
-1 = 全く問題なし
-5 = 暴力、性的、差別、犯罪、脅迫など非常に危険
+// レート制限対策
+let lastRequestTime = 0;
+const MIN_REQUEST_INTERVAL = 5000;
+let requestQueue = Promise.resolve();
 
-返答は数字のみ。
+async function callAPI(apiFunc) {
+  return new Promise((resolve) => {
+    requestQueue = requestQueue.then(async () => {
+      let attempt = 0;
 
-テキスト:
-${content}
-`;
+      while (true) {
+        attempt++;
 
-  try {
-    const res = await model.generateContent(prompt);
-    const text = res.response.text().trim();
-    const score = parseInt(text, 10);
+        try {
+          const now = Date.now();
+          const diff = now - lastRequestTime;
 
-    return isNaN(score) ? 1 : score;
-  } catch {
-    return 1;
-  }
+          if (diff < MIN_REQUEST_INTERVAL) {
+            await new Promise((r) =>
+              setTimeout(r, MIN_REQUEST_INTERVAL - diff)
+            );
+          }
+
+          lastRequestTime = Date.now();
+          const r = await apiFunc();
+          resolve(r);
+          return;
+        } catch (err) {
+          if (err.message.includes("429")) {
+            await new Promise((r) => setTimeout(r, 3000));
+          } else {
+            await new Promise((r) => setTimeout(r, 2000));
+          }
+        }
+      }
+    });
+  });
 }
 
-async function aiJudgeImage(imageData) {
-  const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
-
-  const prompt = `
-この画像の不適切度を「1〜5」で採点してください。
-1 = 問題なし
-5 = 暴力、性的、差別、犯罪、脅迫など非常に危険
-
-返答は数字のみ。
-`;
-
-  try {
-    const res = await model.generateContent([prompt, imageData]);
-    const text = res.response.text().trim();
-    const score = parseInt(text, 10);
-
-    return isNaN(score) ? 1 : score;
-  } catch {
-    return 1;
-  }
-}
-
-// ==============================
-// 📘 画像を BASE64 へ
-// ==============================
+// ====================================
+// 画像取得
+// ====================================
 async function fetchImageAsBase64(url) {
   try {
-    const res = await fetch(url);
+    const res = await fetch(url, { timeout: 10000 });
     if (!res.ok) return null;
 
-    const type = res.headers.get("content-type");
-
-    if (type.includes("gif")) {
-      console.log(`GIF はスキップ: ${url}`);
+    const ct = res.headers.get("content-type");
+    if (ct && ct.includes("image/gif")) {
+      console.log("GIFは無視: " + url);
       return null;
     }
 
-    const buffer = await res.arrayBuffer();
+    const buf = Buffer.from(await res.arrayBuffer());
     return {
       inlineData: {
-        data: Buffer.from(buffer).toString("base64"),
-        mimeType: type,
+        data: buf.toString("base64"),
+        mimeType: ct || "image/jpeg",
       },
     };
   } catch {
@@ -125,112 +118,202 @@ async function fetchImageAsBase64(url) {
   }
 }
 
-// ==============================
-// ⚡ メッセージ監視
-// ==============================
+// ====================================
+// AI テキスト判定
+// ====================================
+async function checkTextContent(text) {
+  try {
+    const model = genAI.getGenerativeModel({
+      model: "gemini-2.5-flash",
+    });
+
+    const prompt = `
+以下のメッセージが攻撃的・暴力的・差別的・脅迫的・不快な場合「悪質」。
+それ以外は「安全」。
+
+メッセージ:
+${text}
+`;
+
+    const result = await callAPI(() =>
+      model.generateContent(prompt)
+    );
+
+    const rep = result.response.text().trim();
+    return rep.includes("悪質");
+  } catch {
+    return false;
+  }
+}
+
+// ====================================
+// AI 画像判定
+// ====================================
+async function checkImageContent(img) {
+  try {
+    const model = genAI.getGenerativeModel({
+      model: "gemini-2.5-flash",
+    });
+
+    const prompt = `
+画像に不適切（暴力・性的・差別など）があれば「悪質」。
+それ以外は「安全」。
+`;
+
+    const result = await callAPI(() =>
+      model.generateContent([prompt, img])
+    );
+
+    const rep = result.response.text().trim();
+    return rep.includes("悪質");
+  } catch {
+    return false;
+  }
+}
+
+// ====================================
+// 監視：メッセージ
+// ====================================
 client.on("messageCreate", async (message) => {
   if (message.author.bot || !message.guild) return;
+  if (WHITELIST_USERS.includes(message.author.username)) return;
 
-  let maxScore = 1;
+  let malicious = false;
+  let reason = "";
 
-  // ---- テキスト ----
-  if (message.content.trim()) {
-    const score = await aiJudgeText(message.content);
-    maxScore = Math.max(maxScore, score);
-    console.log(`テキストスコア: ${score}`);
-  }
-
-  // ---- 画像 ----
-  for (const att of message.attachments.values()) {
-    if (att.contentType?.startsWith("image/")) {
-      const img = await fetchImageAsBase64(att.url);
-      if (img) {
-        const score = await aiJudgeImage(img);
-        maxScore = Math.max(maxScore, score);
-        console.log(`画像スコア: ${score}`);
-      }
+  // テキスト
+  if (message.content.trim().length > 0) {
+    if (await checkTextContent(message.content)) {
+      malicious = true;
+      reason = "不適切なテキスト";
     }
   }
 
-  // ---- Timeout判定 ----
-  if (maxScore >= 4) {
+  // 画像
+  for (const a of message.attachments.values()) {
+    if (!a.contentType?.startsWith("image/")) continue;
+
+    const img = await fetchImageAsBase64(a.url);
+    if (img && (await checkImageContent(img))) {
+      malicious = true;
+      reason += reason ? "、不適切な画像" : "不適切な画像";
+    }
+  }
+
+  if (malicious) {
     const member = await message.guild.members.fetch(message.author.id);
-    await member.timeout(30 * 60 * 1000, `AI判定: スコア${maxScore}`);
+    await member.timeout(TIMEOUT_DURATION, reason);
 
     message.channel.send(
-      `⚠️ **${message.author.username}** をタイムアウトしました（AIスコア: ${maxScore}）`
+      `⛔ **${message.author.username}** を timeout しました\n理由: ${reason}`
     );
-    sendLog(`⛔ Timeout: ${message.author.username}（スコア:${maxScore}）`);
+
+    console.log(`AUTO TIMEOUT → ${message.author.username}: ${reason}`);
   }
 });
 
-// ==============================
-// 🧩 Slash Commands（/to /TOP）
-// ==============================
+// ====================================
+// Slash Commands
+// ====================================
 const commands = [
   new SlashCommandBuilder()
-    .setName("to")
-    .setDescription("動作確認用コマンド"),
+    .setName("top")
+    .setDescription("指定ユーザーを timeout（管理者専用）")
+    .addUserOption((o) =>
+      o.setName("user").setDescription("対象ユーザー").setRequired(true)
+    )
+    .addIntegerOption((o) =>
+      o.setName("seconds").setDescription("秒数").setRequired(true)
+    )
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
   new SlashCommandBuilder()
-    .setName("top")
-    .setDescription("AIを通さずにTimeoutをテストする（管理者限定）")
-    .addUserOption((opt) =>
-      opt.setName("user").setDescription("対象ユーザー").setRequired(true)
-    )
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .setName("to")
+    .setDescription("現在 timeout 中のユーザー一覧"),
 ];
 
 const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
 
-async function register() {
-  try {
-    console.log("スラッシュコマンド登録中...");
-    await rest.put(
-      Routes.applicationCommands(process.env.CLIENT_ID),
-      { body: commands }
+client.once("ready", async () => {
+  console.log(`Bot login → ${client.user.tag}`);
+
+  await rest.put(
+    Routes.applicationCommands(client.user.id),
+    { body: commands }
+  );
+
+  console.log("Slash Commands Registered");
+});
+
+// ====================================
+// コマンド処理
+// ====================================
+client.on("interactionCreate", async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+
+  // ========== /top ==========
+  if (interaction.commandName === "top") {
+    const user = interaction.options.getUser("user");
+    const sec = interaction.options.getInteger("seconds");
+
+    const member = await interaction.guild.members.fetch(user.id);
+
+    await member.timeout(sec * 1000, "管理者による手動timeout");
+
+    interaction.reply(
+      `⛔ 管理者が **${user.tag}** を ${sec} 秒 timeout しました`
     );
-    console.log("スラッシュコマンド登録完了！");
-  } catch (e) {
-    console.log("コマンド登録エラー:", e);
-  }
-}
-register();
 
-// ==============================
-// ⚡ Slash コマンド処理
-// ==============================
-client.on("interactionCreate", async (i) => {
-  if (!i.isChatInputCommand()) return;
-
-  if (i.commandName === "to") {
-    await i.reply("👍 `/to` が実行されました！");
+    console.log(`MANUAL TIMEOUT → ${user.tag}`);
   }
 
-  if (i.commandName === "top") {
-    const user = i.options.getUser("user");
-    const member = await i.guild.members.fetch(user.id);
+  // ========== /to：タイムアウト一覧 ==========
+  if (interaction.commandName === "to") {
+    await interaction.reply("⏳ 調査中…");
 
-    await member.timeout(30 * 60 * 1000, "/TOP（管理者）による強制実行");
+    const members = await interaction.guild.members.fetch();
+    const timeoutUsers = members.filter(
+      (m) => m.communicationDisabledUntilTimestamp
+    );
 
-    await i.reply(`🔨 管理者により **${user.username}** が Timeout されました`);
-    sendLog(`🔨 /TOP → ${user.username} Timeout`);
+    if (timeoutUsers.size === 0) {
+      return interaction.editReply("✅ timeout 中のユーザーはいません");
+    }
+
+    let msg = "⛔ **timeout 中のユーザー一覧**\n\n";
+
+    timeoutUsers.forEach((m) => {
+      const end = m.communicationDisabledUntilTimestamp;
+      const now = Date.now();
+      const remain = Math.max(0, Math.floor((end - now) / 1000));
+
+      msg += `👤 ${m.user.tag}\n`;
+      msg += `・残り ${remain} 秒\n`;
+      msg += `・理由: ${m.communicationDisabledUntilReason ?? "不明"}\n\n`;
+    });
+
+    interaction.editReply(msg);
   }
 });
 
-// ==============================
-// 🔌 起動
-// ==============================
-client.once("ready", () => {
-  console.log(`🎉 Bot 起動: ${client.user.tag}`);
-});
-
-console.log("Discord に接続中…");
+// ====================================
+// Bot 起動
+// ====================================
+console.log("Discord 接続中…");
 client.login(process.env.DISCORD_TOKEN);
 
-// ==============================
-// 🌐 Web Server
-// ==============================
+// ====================================
+// Web サーバー（Render対策）
+// ====================================
 const app = express();
-app.get("/", (req, res) => res.send("Bot is running!"));
-app.listen(process.env.PORT || 3000);
+const port = process.env.PORT || 3000;
+
+app.get("/", (req, res) => {
+  res.json({
+    status: "Bot is running!",
+    uptime: process.uptime(),
+    now: new Date().toISOString(),
+  });
+});
+
+app.listen(port, () => console.log(`Web OK : ${port}`));
