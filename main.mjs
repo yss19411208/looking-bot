@@ -251,9 +251,23 @@ async function updateRealtimeTimeout() {
           text += "\n\n最終更新: " + new Date().toLocaleTimeString("ja-JP");
         }
 
+        // メッセージが存在しない場合は再作成
+        if (!timeoutStatusMessage) {
+          console.log("⚠️ メッセージが削除されたため再作成します");
+          clearInterval(updateInterval);
+          updateRealtimeTimeout();
+          return;
+        }
+
         // メッセージを編集（変更がある場合のみ、キューで制御）
         if (timeoutStatusMessage.content !== text) {
           editQueue = editQueue.then(async () => {
+            // 編集前に再度nullチェック
+            if (!timeoutStatusMessage) {
+              console.log("⚠️ 編集時にメッセージがnullです");
+              return;
+            }
+
             const timeSinceLastEdit = Date.now() - lastEditTime;
             // レート制限対策：最低500ms空ける
             if (timeSinceLastEdit < 500) {
@@ -266,7 +280,7 @@ async function updateRealtimeTimeout() {
             } catch (err) {
               console.log("メッセージ編集エラー:", err.message);
               // メッセージが削除された場合は再作成
-              if (err.code === 10008) {
+              if (err.code === 10008 || err.message.includes("Unknown Message")) {
                 timeoutStatusMessage = null;
                 clearInterval(updateInterval);
                 updateRealtimeTimeout();
