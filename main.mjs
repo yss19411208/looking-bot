@@ -338,6 +338,18 @@ client.on("interactionCreate", async (interaction) => {
       const sec = interaction.options.getInteger("seconds");
       console.log(`対象: ${user.tag}, 秒数: ${sec}`);
 
+      // Discordの最大タイムアウト期間は28日（2,419,200秒）
+      const MAX_TIMEOUT = 2419200;
+      if (sec > MAX_TIMEOUT) {
+        await interaction.editReply(`❌ タイムアウトは最大28日（2,419,200秒）までです。\n指定された秒数: ${sec}秒`);
+        return;
+      }
+
+      if (sec < 1) {
+        await interaction.editReply(`❌ タイムアウトは1秒以上で指定してください。`);
+        return;
+      }
+
       const member = await guild.members.fetch(user.id);
       console.log("メンバー取得完了");
       
