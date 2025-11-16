@@ -148,43 +148,94 @@ function getTimeoutRemaining(member) {
 }
 
 // ====================================
+// 時間をフォーマット
+// ====================================
+function formatTime(seconds) {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  
+  if (h > 0) return `${h}時間${m}分${s}秒`;
+  if (m > 0) return `${m}分${s}秒`;
+  return `${s}秒`;
+}
+
+// ====================================
 // リアルタイム Timeout 更新（指定チャンネル）
 // ====================================
 let timeoutStatusMessage = null;
+let updateInterval = null;
 const TIMEOUT_STATUS_CHANNEL = process.env.TIMEOUT_CHANNEL;
 
 async function updateRealtimeTimeout() {
-  if (!TIMEOUT_STATUS_CHANNEL) return;
-
-  const ch = await client.channels.fetch(TIMEOUT_STATUS_CHANNEL).catch(() => null);
-  if (!ch || !ch.guild) return;
-
-  const guild = ch.guild;
-
-  if (!timeoutStatusMessage) {
-    timeoutStatusMessage = await ch.send("⏳ Timeout 中のユーザーを取得中...");
+  if (!TIMEOUT_STATUS_CHANNEL) {
+    console.log("⚠️ TIMEOUT_CHANNEL が設定されていません");
+    return;
   }
 
-  setInterval(async () => {
-    try {
-      await guild.members.fetch({ force: true }).catch(() => {}); // 常に最新情報取得
-      const timeoutUsers = guild.members.cache
-        .map((m) => ({ member: m, remain: getTimeoutRemaining(m) }))
-        .filter((x) => x.remain !== null);
-
-      const text =
-        timeoutUsers.length === 0
-          ? "⏳ Timeout 中のユーザーはいません"
-          : "⏳ **Timeout 中のユーザー一覧（1秒ごと更新）**\n\n" +
-            timeoutUsers
-              .map((u) => `👤 ${u.member.user.tag} ・残り ${u.remain} 秒`)
-              .join("\n");
-
-      await timeoutStatusMessage.edit(text).catch(() => {});
-    } catch (err) {
-      console.log("リアルタイム更新失敗:", err.code || err.message || err);
+  try {
+    const ch = await client.channels.fetch(TIMEOUT_STATUS_CHANNEL).catch(() => null);
+    if (!ch || !ch.guild) {
+      console.log("⚠️ タイムアウト表示チャンネルが見つかりません");
+      return;
     }
-  }, 1000);
+
+    const guild = ch.guild;
+
+    // 初回メッセージ送信
+    if (!timeoutStatusMessage) {
+      timeoutStatusMessage = await ch.send("⏳ **Timeout 監視を開始します...**");
+      console.log("✅ リアルタイムタイムアウト表示を開始しました");
+    }
+
+    // 既存のインターバルをクリア
+    if (updateInterval) clearInterval(updateInterval);
+
+    // 1秒ごとに更新
+    updateInterval = setInterval(async () => {
+      try {
+        // メンバー情報を強制更新
+        await guild.members.fetch({ force: true }).catch(() => {});
+        
+        // タイムアウト中のユーザーを取得
+        const timeoutUsers = guild.members.cache
+          .map((m) => ({ member: m, remain: getTimeoutRemaining(m) }))
+          .filter((x) => x.remain !== null)
+          .sort((a, b) => b.remain - a.remain); // 残り時間が長い順
+
+        let text;
+        if (timeoutUsers.length === 0) {
+          text = "✅ **現在タイムアウト中のユーザーはいません**\n\n最終更新: " + new Date().toLocaleTimeString("ja-JP");
+        } else {
+          text = `⏳ **タイムアウト中のユーザー一覧** (${timeoutUsers.length}人)\n\n`;
+          text += timeoutUsers
+            .map((u, i) => {
+              const bar = "█".repeat(Math.max(1, Math.floor(u.remain / 60)));
+              return `${i + 1}. **${u.member.user.tag}**\n   残り: ${formatTime(u.remain)} ${bar}`;
+            })
+            .join("\n\n");
+          text += "\n\n最終更新: " + new Date().toLocaleTimeString("ja-JP");
+        }
+
+        // メッセージを編集（変更がある場合のみ）
+        if (timeoutStatusMessage.content !== text) {
+          await timeoutStatusMessage.edit(text).catch((err) => {
+            console.log("メッセージ編集エラー:", err.message);
+            // メッセージが削除された場合は再作成
+            if (err.code === 10008) {
+              timeoutStatusMessage = null;
+              updateRealtimeTimeout();
+            }
+          });
+        }
+      } catch (err) {
+        console.log("リアルタイム更新失敗:", err.code || err.message);
+      }
+    }, 1000);
+
+  } catch (err) {
+    console.log("リアルタイム表示の初期化エラー:", err.message);
+  }
 }
 
 // ====================================
@@ -211,7 +262,7 @@ client.on("messageCreate", async (message) => {
     const member = await message.guild.members.fetch(message.author.id);
     await member.timeout(TIMEOUT_DURATION);
 
-    message.channel.send(`⛔ **${message.author.username}** を timeout しました`);
+    message.channel.send(`⛔ **${message.author.username}** を timeout しました (${TIMEOUT_DURATION / 1000 / 60}分)`);
     console.log(`AUTO TIMEOUT → ${message.author.username}`);
   }
 });
@@ -240,7 +291,8 @@ client.once("ready", async () => {
   await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
   console.log("Slash Commands Registered");
 
-  updateRealtimeTimeout();
+  // リアルタイムタイムアウト表示を開始
+  setTimeout(() => updateRealtimeTimeout(), 2000);
 });
 
 // ====================================
@@ -261,7 +313,7 @@ client.on("interactionCreate", async (interaction) => {
     const member = await guild.members.fetch(user.id);
     await member.timeout(sec * 1000, "管理者による手動timeout");
 
-    await interaction.editReply(`⛔ 管理者が **${user.tag}** を ${sec} 秒 timeout しました`);
+    await interaction.editReply(`⛔ 管理者が **${user.tag}** を ${sec} 秒 (${formatTime(sec)}) timeout しました`);
     console.log(`MANUAL TIMEOUT → ${user.tag}`);
     return;
   }
@@ -269,14 +321,15 @@ client.on("interactionCreate", async (interaction) => {
   if (interaction.commandName === "to") {
     const timeoutUsers = guild.members.cache
       .map((m) => ({ member: m, remain: getTimeoutRemaining(m) }))
-      .filter((x) => x.remain !== null);
+      .filter((x) => x.remain !== null)
+      .sort((a, b) => b.remain - a.remain);
 
     if (timeoutUsers.length === 0)
       return interaction.reply("✅ timeout 中のユーザーはいません");
 
     const msg =
-      "⏳ **Timeout 中のユーザー一覧**\n\n" +
-      timeoutUsers.map((u) => `👤 ${u.member.user.tag} ・残り ${u.remain} 秒`).join("\n");
+      `⏳ **Timeout 中のユーザー一覧** (${timeoutUsers.length}人)\n\n` +
+      timeoutUsers.map((u, i) => `${i + 1}. **${u.member.user.tag}** ・残り ${formatTime(u.remain)}`).join("\n");
 
     interaction.reply(msg);
   }
