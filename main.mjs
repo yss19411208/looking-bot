@@ -167,7 +167,6 @@ async function updateRealtimeTimeout() {
 
   setInterval(async () => {
     try {
-      // fetchは必要な場合のみ
       await guild.members.fetch({ force: false }).catch(() => {});
       const timeoutUsers = guild.members.cache
         .map((m) => ({ member: m, remain: getTimeoutRemaining(m) }))
@@ -177,9 +176,7 @@ async function updateRealtimeTimeout() {
         timeoutUsers.length === 0
           ? "⏳ Timeout 中のユーザーはいません"
           : "⏳ **Timeout 中のユーザー一覧（1秒ごと更新）**\n\n" +
-            timeoutUsers
-              .map((u) => `👤 ${u.member.user.tag} ・残り ${u.remain} 秒`)
-              .join("\n");
+            timeoutUsers.map((u) => `👤 ${u.member.user.tag} ・残り ${u.remain} 秒`).join("\n");
 
       await timeoutStatusMessage.edit(text);
     } catch (err) {
@@ -209,11 +206,14 @@ client.on("messageCreate", async (message) => {
   }
 
   if (malicious) {
-    const member = await message.guild.members.fetch(message.author.id);
-    await member.timeout(TIMEOUT_DURATION);
-
-    message.channel.send(`⛔ **${message.author.username}** を timeout しました`);
-    console.log(`AUTO TIMEOUT → ${message.author.username}`);
+    try {
+      const member = await message.guild.members.fetch(message.author.id);
+      await member.timeout(TIMEOUT_DURATION);
+      message.channel.send(`⛔ **${message.author.username}** を timeout しました`);
+      console.log(`AUTO TIMEOUT → ${message.author.username}`);
+    } catch (err) {
+      console.log("自動Timeout失敗:", err);
+    }
   }
 });
 
@@ -245,37 +245,48 @@ client.once("ready", async () => {
 });
 
 // ====================================
-// /to コマンド
+// /top と /to コマンド
 // ====================================
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
   const guild = interaction.guild;
-  await guild.members.fetch({ force: false });
+  if (!guild) return interaction.reply({ content: "Guildが取得できませんでした", ephemeral: true });
 
   if (interaction.commandName === "top") {
     const user = interaction.options.getUser("user");
     const sec = interaction.options.getInteger("seconds");
-    const member = await guild.members.fetch(user.id);
-    await member.timeout(sec * 1000);
 
-    interaction.reply(`⛔ 管理者が **${user.tag}** を ${sec} 秒 timeout しました`);
-    console.log(`MANUAL TIMEOUT → ${user.tag}`);
+    try {
+      const member = await guild.members.fetch(user.id);
+      await member.timeout(sec * 1000);
+      await interaction.reply(`⛔ 管理者が **${user.tag}** を ${sec} 秒 timeout しました`);
+      console.log(`MANUAL TIMEOUT → ${user.tag}`);
+    } catch (err) {
+      console.log("TOPコマンド失敗:", err);
+      await interaction.reply({ content: "⚠️ Timeout に失敗しました（Botの権限を確認してください）", ephemeral: true });
+    }
     return;
   }
 
   if (interaction.commandName === "to") {
-    const timeoutUsers = guild.members.cache
-      .map((m) => ({ member: m, remain: getTimeoutRemaining(m) }))
-      .filter((x) => x.remain !== null);
+    try {
+      await guild.members.fetch({ force: false });
+      const timeoutUsers = guild.members.cache
+        .map((m) => ({ member: m, remain: getTimeoutRemaining(m) }))
+        .filter((x) => x.remain !== null);
 
-    if (timeoutUsers.length === 0) return interaction.reply("✅ timeout 中のユーザーはいません");
+      if (timeoutUsers.length === 0) return interaction.reply("✅ timeout 中のユーザーはいません");
 
-    const msg =
-      "⏳ **Timeout 中のユーザー一覧**\n\n" +
-      timeoutUsers.map((u) => `👤 ${u.member.user.tag} ・残り ${u.remain} 秒`).join("\n");
+      const msg =
+        "⏳ **Timeout 中のユーザー一覧**\n\n" +
+        timeoutUsers.map((u) => `👤 ${u.member.user.tag} ・残り ${u.remain} 秒`).join("\n");
 
-    interaction.reply(msg);
+      interaction.reply(msg);
+    } catch (err) {
+      console.log("/to コマンド失敗:", err);
+      interaction.reply({ content: "⚠️ ユーザー一覧の取得に失敗しました", ephemeral: true });
+    }
   }
 });
 
