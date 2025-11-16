@@ -27,21 +27,18 @@ const client = new Client({
 });
 
 // ====================================
-// LOG用チャンネルへ console 出力を送信
-// （無限ループを防ぐため、log→送信→log しない）
+// LOG用チャンネルに console 出力
 // ====================================
 const originalLog = console.log;
 console.log = (...args) => {
-  originalLog(...args); // ローカルには出す
+  originalLog(...args);
 
   const text = args.join(" ");
   const chId = process.env.CHANNEL_ID;
   if (!client.isReady() || !chId) return;
 
   const ch = client.channels.cache.get(chId);
-  if (ch && ch.send) {
-    ch.send("**LOG:** " + text).catch(() => {});
-  }
+  if (ch && ch.send) ch.send("**LOG:** " + text).catch(() => {});
 };
 
 // ====================================
@@ -61,31 +58,20 @@ let requestQueue = Promise.resolve();
 async function callAPI(apiFunc) {
   return new Promise((resolve) => {
     requestQueue = requestQueue.then(async () => {
-      let attempt = 0;
-
       while (true) {
-        attempt++;
-
         try {
           const now = Date.now();
           const diff = now - lastRequestTime;
-
-          if (diff < MIN_REQUEST_INTERVAL) {
-            await new Promise((r) =>
-              setTimeout(r, MIN_REQUEST_INTERVAL - diff)
-            );
-          }
+          if (diff < MIN_REQUEST_INTERVAL)
+            await new Promise((r) => setTimeout(r, MIN_REQUEST_INTERVAL - diff));
 
           lastRequestTime = Date.now();
           const r = await apiFunc();
           resolve(r);
           return;
         } catch (err) {
-          if (err.message.includes("429")) {
-            await new Promise((r) => setTimeout(r, 3000));
-          } else {
-            await new Promise((r) => setTimeout(r, 2000));
-          }
+          if (err.message.includes("429")) await new Promise((r) => setTimeout(r, 3000));
+          else await new Promise((r) => setTimeout(r, 2000));
         }
       }
     });
@@ -93,7 +79,7 @@ async function callAPI(apiFunc) {
 }
 
 // ====================================
-// 画像取得
+// 画像 Base64 変換
 // ====================================
 async function fetchImageAsBase64(url) {
   try {
@@ -107,12 +93,7 @@ async function fetchImageAsBase64(url) {
     }
 
     const buf = Buffer.from(await res.arrayBuffer());
-    return {
-      inlineData: {
-        data: buf.toString("base64"),
-        mimeType: ct || "image/jpeg",
-      },
-    };
+    return { inlineData: { data: buf.toString("base64"), mimeType: ct || "image/jpeg" } };
   } catch {
     return null;
   }
@@ -123,22 +104,15 @@ async function fetchImageAsBase64(url) {
 // ====================================
 async function checkTextContent(text) {
   try {
-    const model = genAI.getGenerativeModel({
-      model: "gemini-2.5-flash",
-    });
-
+    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
     const prompt = `
 以下のメッセージが攻撃的・暴力的・差別的・脅迫的・不快な場合「悪質」。
 それ以外は「安全」。
 
 メッセージ:
 ${text}
-`;
-
-    const result = await callAPI(() =>
-      model.generateContent(prompt)
-    );
-
+    `;
+    const result = await callAPI(() => model.generateContent(prompt));
     const rep = result.response.text().trim();
     return rep.includes("悪質");
   } catch {
@@ -151,19 +125,12 @@ ${text}
 // ====================================
 async function checkImageContent(img) {
   try {
-    const model = genAI.getGenerativeModel({
-      model: "gemini-2.5-flash",
-    });
-
+    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
     const prompt = `
 画像に不適切（暴力・性的・差別など）があれば「悪質」。
 それ以外は「安全」。
-`;
-
-    const result = await callAPI(() =>
-      model.generateContent([prompt, img])
-    );
-
+    `;
+    const result = await callAPI(() => model.generateContent([prompt, img]));
     const rep = result.response.text().trim();
     return rep.includes("悪質");
   } catch {
@@ -172,43 +139,81 @@ async function checkImageContent(img) {
 }
 
 // ====================================
-// 監視：メッセージ
+// Timeout残秒取得（0秒以下は除外）
+// ====================================
+function getTimeoutRemaining(member) {
+  const end = member.communicationDisabledUntilTimestamp ?? 0;
+  const remain = Math.ceil((end - Date.now()) / 1000);
+  return remain > 0 ? remain : null;
+}
+
+// ====================================
+// リアルタイム Timeout 更新（指定チャンネル）
+// ====================================
+let timeoutStatusMessage = null;
+const TIMEOUT_STATUS_CHANNEL = process.env.TIMEOUT_CHANNEL;
+
+async function updateRealtimeTimeout() {
+  if (!TIMEOUT_STATUS_CHANNEL) return;
+
+  const ch = await client.channels.fetch(TIMEOUT_STATUS_CHANNEL).catch(() => null);
+  if (!ch || !ch.guild) return;
+
+  const guild = ch.guild;
+
+  if (!timeoutStatusMessage) {
+    timeoutStatusMessage = await ch.send("⏳ Timeout 中のユーザーを取得中...");
+  }
+
+  setInterval(async () => {
+    try {
+      // fetchは必要な場合のみ
+      await guild.members.fetch({ force: false }).catch(() => {});
+      const timeoutUsers = guild.members.cache
+        .map((m) => ({ member: m, remain: getTimeoutRemaining(m) }))
+        .filter((x) => x.remain !== null);
+
+      const text =
+        timeoutUsers.length === 0
+          ? "⏳ Timeout 中のユーザーはいません"
+          : "⏳ **Timeout 中のユーザー一覧（1秒ごと更新）**\n\n" +
+            timeoutUsers
+              .map((u) => `👤 ${u.member.user.tag} ・残り ${u.remain} 秒`)
+              .join("\n");
+
+      await timeoutStatusMessage.edit(text);
+    } catch (err) {
+      console.log("リアルタイム更新失敗:", err.code || err.message || err);
+    }
+  }, 1000);
+}
+
+// ====================================
+// メッセージ監視
 // ====================================
 client.on("messageCreate", async (message) => {
   if (message.author.bot || !message.guild) return;
   if (WHITELIST_USERS.includes(message.author.username)) return;
 
   let malicious = false;
-  let reason = "";
 
-  // テキスト
   if (message.content.trim().length > 0) {
-    if (await checkTextContent(message.content)) {
-      malicious = true;
-      reason = "不適切なテキスト";
-    }
+    if (await checkTextContent(message.content)) malicious = true;
   }
 
-  // 画像
   for (const a of message.attachments.values()) {
     if (!a.contentType?.startsWith("image/")) continue;
 
     const img = await fetchImageAsBase64(a.url);
-    if (img && (await checkImageContent(img))) {
-      malicious = true;
-      reason += reason ? "、不適切な画像" : "不適切な画像";
-    }
+    if (img && (await checkImageContent(img))) malicious = true;
   }
 
   if (malicious) {
     const member = await message.guild.members.fetch(message.author.id);
-    await member.timeout(TIMEOUT_DURATION, reason);
+    await member.timeout(TIMEOUT_DURATION);
 
-    message.channel.send(
-      `⛔ **${message.author.username}** を timeout しました\n理由: ${reason}`
-    );
-
-    console.log(`AUTO TIMEOUT → ${message.author.username}: ${reason}`);
+    message.channel.send(`⛔ **${message.author.username}** を timeout しました`);
+    console.log(`AUTO TIMEOUT → ${message.author.username}`);
   }
 });
 
@@ -219,80 +224,58 @@ const commands = [
   new SlashCommandBuilder()
     .setName("top")
     .setDescription("指定ユーザーを timeout（管理者専用）")
-    .addUserOption((o) =>
-      o.setName("user").setDescription("対象ユーザー").setRequired(true)
-    )
-    .addIntegerOption((o) =>
-      o.setName("seconds").setDescription("秒数").setRequired(true)
-    )
+    .addUserOption((o) => o.setName("user").setDescription("対象ユーザー").setRequired(true))
+    .addIntegerOption((o) => o.setName("seconds").setDescription("秒数").setRequired(true))
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
-  new SlashCommandBuilder()
-    .setName("to")
-    .setDescription("現在 timeout 中のユーザー一覧"),
+  new SlashCommandBuilder().setName("to").setDescription("現在 timeout 中のユーザー一覧"),
 ];
 
 const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
 
+// ====================================
+// ready
+// ====================================
 client.once("ready", async () => {
   console.log(`Bot login → ${client.user.tag}`);
-
-  await rest.put(
-    Routes.applicationCommands(client.user.id),
-    { body: commands }
-  );
-
+  await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
   console.log("Slash Commands Registered");
+
+  updateRealtimeTimeout(); // 指定チャンネルでリアルタイム更新
 });
 
 // ====================================
-// コマンド処理
+// /to コマンド
 // ====================================
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
-  // ========== /top ==========
+  const guild = interaction.guild;
+  await guild.members.fetch({ force: false });
+
   if (interaction.commandName === "top") {
     const user = interaction.options.getUser("user");
     const sec = interaction.options.getInteger("seconds");
+    const member = await guild.members.fetch(user.id);
+    await member.timeout(sec * 1000);
 
-    const member = await interaction.guild.members.fetch(user.id);
-
-    await member.timeout(sec * 1000, "管理者による手動timeout");
-
-    interaction.reply(
-      `⛔ 管理者が **${user.tag}** を ${sec} 秒 timeout しました`
-    );
-
+    interaction.reply(`⛔ 管理者が **${user.tag}** を ${sec} 秒 timeout しました`);
     console.log(`MANUAL TIMEOUT → ${user.tag}`);
+    return;
   }
 
-  // ========== /to：タイムアウト一覧 ==========
   if (interaction.commandName === "to") {
-    await interaction.reply("⏳ 調査中…");
+    const timeoutUsers = guild.members.cache
+      .map((m) => ({ member: m, remain: getTimeoutRemaining(m) }))
+      .filter((x) => x.remain !== null);
 
-    const members = await interaction.guild.members.fetch();
-    const timeoutUsers = members.filter(
-      (m) => m.communicationDisabledUntilTimestamp
-    );
+    if (timeoutUsers.length === 0) return interaction.reply("✅ timeout 中のユーザーはいません");
 
-    if (timeoutUsers.size === 0) {
-      return interaction.editReply("✅ timeout 中のユーザーはいません");
-    }
+    const msg =
+      "⏳ **Timeout 中のユーザー一覧**\n\n" +
+      timeoutUsers.map((u) => `👤 ${u.member.user.tag} ・残り ${u.remain} 秒`).join("\n");
 
-    let msg = "⛔ **timeout 中のユーザー一覧**\n\n";
-
-    timeoutUsers.forEach((m) => {
-      const end = m.communicationDisabledUntilTimestamp;
-      const now = Date.now();
-      const remain = Math.max(0, Math.floor((end - now) / 1000));
-
-      msg += `👤 ${m.user.tag}\n`;
-      msg += `・残り ${remain} 秒\n`;
-      msg += `・理由: ${m.communicationDisabledUntilReason ?? "不明"}\n\n`;
-    });
-
-    interaction.editReply(msg);
+    interaction.reply(msg);
   }
 });
 
@@ -307,13 +290,7 @@ client.login(process.env.DISCORD_TOKEN);
 // ====================================
 const app = express();
 const port = process.env.PORT || 3000;
-
 app.get("/", (req, res) => {
-  res.json({
-    status: "Bot is running!",
-    uptime: process.uptime(),
-    now: new Date().toISOString(),
-  });
+  res.json({ status: "Bot is running!", uptime: process.uptime(), now: new Date().toISOString() });
 });
-
 app.listen(port, () => console.log(`Web OK : ${port}`));

@@ -19,7 +19,7 @@
   "homepage": "https://github.com/yss19411208/looking-bot#readme",
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
-    "discord.js": "^14.24.0",
+    "discord.js": "^14.24.2",
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
     "node-fetch": "^3.3.2"
