@@ -191,11 +191,17 @@ async function updateRealtimeTimeout() {
     // 既存のインターバルをクリア
     if (updateInterval) clearInterval(updateInterval);
 
+    let lastEditTime = 0;
+    let editQueue = Promise.resolve();
+    
     // 1秒ごとに更新
     updateInterval = setInterval(async () => {
       try {
-        // メンバー情報を強制更新
-        await guild.members.fetch({ force: true }).catch(() => {});
+        // メンバー情報を強制更新（キャッシュから取得して負荷軽減）
+        const now = Date.now();
+        if (now - lastEditTime > 10000) {
+          await guild.members.fetch({ force: true }).catch(() => {});
+        }
         
         // タイムアウト中のユーザーを取得
         const timeoutUsers = guild.members.cache
@@ -217,14 +223,31 @@ async function updateRealtimeTimeout() {
           text += "\n\n最終更新: " + new Date().toLocaleTimeString("ja-JP");
         }
 
-        // メッセージを編集（変更がある場合のみ）
+        // メッセージを編集（変更がある場合のみ、キューで制御）
         if (timeoutStatusMessage.content !== text) {
-          await timeoutStatusMessage.edit(text).catch((err) => {
-            console.log("メッセージ編集エラー:", err.message);
-            // メッセージが削除された場合は再作成
-            if (err.code === 10008) {
-              timeoutStatusMessage = null;
-              updateRealtimeTimeout();
+          editQueue = editQueue.then(async () => {
+            const timeSinceLastEdit = Date.now() - lastEditTime;
+            // レート制限対策：最低500ms空ける
+            if (timeSinceLastEdit < 500) {
+              await new Promise(r => setTimeout(r, 500 - timeSinceLastEdit));
+            }
+            
+            try {
+              await timeoutStatusMessage.edit(text);
+              lastEditTime = Date.now();
+            } catch (err) {
+              console.log("メッセージ編集エラー:", err.message);
+              // メッセージが削除された場合は再作成
+              if (err.code === 10008) {
+                timeoutStatusMessage = null;
+                clearInterval(updateInterval);
+                updateRealtimeTimeout();
+              }
+              // レート制限エラーの場合は少し待つ
+              if (err.code === 429) {
+                console.log("⚠️ レート制限検知 - 5秒待機");
+                await new Promise(r => setTimeout(r, 5000));
+              }
             }
           });
         }
