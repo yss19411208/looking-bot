@@ -328,16 +328,31 @@ client.on("interactionCreate", async (interaction) => {
   await guild.members.fetch({ force: false });
 
   if (interaction.commandName === "top") {
-    // deferReplyで3秒制限回避
-    await interaction.deferReply();
+    try {
+      console.log("TOP コマンド実行開始");
+      
+      // deferReplyで3秒制限回避
+      await interaction.deferReply();
+      console.log("deferReply 完了");
 
-    const user = interaction.options.getUser("user");
-    const sec = interaction.options.getInteger("seconds");
-    const member = await guild.members.fetch(user.id);
-    await member.timeout(sec * 1000, "管理者による手動timeout");
+      const user = interaction.options.getUser("user");
+      const sec = interaction.options.getInteger("seconds");
+      console.log(`対象: ${user.tag}, 秒数: ${sec}`);
 
-    await interaction.editReply(`⛔ 管理者が **${user.tag}** を ${sec} 秒 (${formatTime(sec)}) timeout しました`);
-    console.log(`MANUAL TIMEOUT → ${user.tag}`);
+      const member = await guild.members.fetch(user.id);
+      console.log("メンバー取得完了");
+      
+      await member.timeout(sec * 1000, "管理者による手動timeout");
+      console.log("タイムアウト実行完了");
+
+      await interaction.editReply(`⛔ 管理者が **${user.tag}** を ${sec} 秒 (${formatTime(sec)}) timeout しました`);
+      console.log(`MANUAL TIMEOUT → ${user.tag}`);
+    } catch (err) {
+      console.log("TOP コマンドエラー:", err.message, err.code);
+      await interaction.editReply(`❌ エラーが発生しました: ${err.message}`).catch(() => {
+        interaction.reply(`❌ エラーが発生しました: ${err.message}`).catch(() => {});
+      });
+    }
     return;
   }
 
