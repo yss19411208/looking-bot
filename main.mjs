@@ -6,6 +6,7 @@ import {
   Routes,
   REST,
   PermissionFlagsBits,
+  EmbedBuilder,
 } from "discord.js";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import dotenv from "dotenv";
@@ -27,19 +28,27 @@ const client = new Client({
 });
 
 // ====================================
-// LOG用チャンネルに console 出力
+// LOG用チャンネルに埋め込みメッセージ送信
 // ====================================
-const originalLog = console.log;
-console.log = (...args) => {
-  originalLog(...args);
-
-  const text = args.join(" ");
+async function sendLog(title, description, color = 0x00ff00, fields = []) {
   const chId = process.env.CHANNEL_ID;
   if (!client.isReady() || !chId) return;
 
   const ch = client.channels.cache.get(chId);
-  if (ch && ch.send) ch.send("**LOG:** " + text).catch(() => {});
-};
+  if (!ch || !ch.send) return;
+
+  const embed = new EmbedBuilder()
+    .setTitle(title)
+    .setDescription(description)
+    .setColor(color)
+    .setTimestamp();
+
+  if (fields.length > 0) {
+    embed.addFields(fields);
+  }
+
+  ch.send({ embeds: [embed] }).catch(() => {});
+}
 
 // ====================================
 // AIモデル
@@ -106,17 +115,25 @@ async function checkTextContent(text) {
   try {
     const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
     const prompt = `
-以下のメッセージが攻撃的・暴力的・差別的・脅迫的・不快な場合「悪質」。
-それ以外は「安全」。
+以下のメッセージが攻撃的・暴力的・差別的・脅迫的・不快な場合「悪質」と判定理由を答えてください。
+それ以外は「安全」と答えてください。
+
+フォーマット:
+判定: [悪質/安全]
+理由: [具体的な理由]
 
 メッセージ:
 ${text}
     `;
     const result = await callAPI(() => model.generateContent(prompt));
     const rep = result.response.text().trim();
-    return rep.includes("悪質");
-  } catch {
-    return false;
+    
+    const isMalicious = rep.includes("悪質");
+    const reason = rep.split("理由:")[1]?.trim() || "理由不明";
+    
+    return { isMalicious, reason, fullResponse: rep };
+  } catch (err) {
+    return { isMalicious: false, reason: "判定エラー", fullResponse: err.message };
   }
 }
 
@@ -127,14 +144,22 @@ async function checkImageContent(img) {
   try {
     const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
     const prompt = `
-画像に不適切（暴力・性的・差別など）があれば「悪質」。
-それ以外は「安全」。
+画像に不適切（暴力・性的・差別など）があれば「悪質」と判定理由を答えてください。
+それ以外は「安全」と答えてください。
+
+フォーマット:
+判定: [悪質/安全]
+理由: [具体的な理由]
     `;
     const result = await callAPI(() => model.generateContent([prompt, img]));
     const rep = result.response.text().trim();
-    return rep.includes("悪質");
-  } catch {
-    return false;
+    
+    const isMalicious = rep.includes("悪質");
+    const reason = rep.split("理由:")[1]?.trim() || "理由不明";
+    
+    return { isMalicious, reason, fullResponse: rep };
+  } catch (err) {
+    return { isMalicious: false, reason: "判定エラー", fullResponse: err.message };
   }
 }
 
@@ -192,15 +217,18 @@ async function updateRealtimeTimeout() {
     if (updateInterval) clearInterval(updateInterval);
 
     let lastEditTime = 0;
+    let lastFullFetch = 0;
     let editQueue = Promise.resolve();
     
     // 1秒ごとに更新
     updateInterval = setInterval(async () => {
       try {
-        // メンバー情報を強制更新（キャッシュから取得して負荷軽減）
         const now = Date.now();
-        if (now - lastEditTime > 10000) {
+        
+        // 5秒ごとにメンバー情報を強制更新
+        if (now - lastFullFetch > 5000) {
           await guild.members.fetch({ force: true }).catch(() => {});
+          lastFullFetch = now;
         }
         
         // タイムアウト中のユーザーを取得
@@ -269,24 +297,84 @@ client.on("messageCreate", async (message) => {
   if (WHITELIST_USERS.includes(message.author.username)) return;
 
   let malicious = false;
+  let reasons = [];
+  let detectedContent = [];
 
+  // テキスト判定
   if (message.content.trim().length > 0) {
-    if (await checkTextContent(message.content)) malicious = true;
+    const result = await checkTextContent(message.content);
+    if (result.isMalicious) {
+      malicious = true;
+      reasons.push(`📝 テキスト: ${result.reason}`);
+      detectedContent.push({
+        type: "テキスト",
+        content: message.content.substring(0, 100) + (message.content.length > 100 ? "..." : ""),
+        reason: result.reason,
+      });
+    }
   }
 
+  // 画像判定
   for (const a of message.attachments.values()) {
     if (!a.contentType?.startsWith("image/")) continue;
 
     const img = await fetchImageAsBase64(a.url);
-    if (img && (await checkImageContent(img))) malicious = true;
+    if (img) {
+      const result = await checkImageContent(img);
+      if (result.isMalicious) {
+        malicious = true;
+        reasons.push(`🖼️ 画像: ${result.reason}`);
+        detectedContent.push({
+          type: "画像",
+          content: a.url,
+          reason: result.reason,
+        });
+      }
+    }
   }
 
   if (malicious) {
     const member = await message.guild.members.fetch(message.author.id);
     await member.timeout(TIMEOUT_DURATION);
 
+    // タイムアウト後、メンバー情報を更新
+    await message.guild.members.fetch({ force: true }).catch(() => {});
+
+    // 詳細ログを送信
+    const fields = [
+      { name: "👤 対象ユーザー", value: `${message.author.tag} (${message.author.id})`, inline: false },
+      { name: "⏱️ タイムアウト期間", value: formatTime(TIMEOUT_DURATION / 1000), inline: true },
+      { name: "📍 チャンネル", value: `<#${message.channel.id}>`, inline: true },
+      { name: "🚨 検出理由", value: reasons.join("\n"), inline: false },
+    ];
+
+    if (detectedContent.length > 0) {
+      detectedContent.forEach((item, i) => {
+        if (item.type === "テキスト") {
+          fields.push({
+            name: `📝 検出内容 ${i + 1}`,
+            value: `\`\`\`${item.content}\`\`\`\n理由: ${item.reason}`,
+            inline: false,
+          });
+        } else if (item.type === "画像") {
+          fields.push({
+            name: `🖼️ 検出内容 ${i + 1}`,
+            value: `[画像リンク](${item.content})\n理由: ${item.reason}`,
+            inline: false,
+          });
+        }
+      });
+    }
+
+    await sendLog(
+      "🔨 自動タイムアウト実行",
+      `**${message.author.username}** がAIによって自動的にタイムアウトされました`,
+      0xff0000, // 赤色
+      fields
+    );
+
     message.channel.send(`⛔ **${message.author.username}** を timeout しました (${TIMEOUT_DURATION / 1000 / 60}分)`);
-    console.log(`AUTO TIMEOUT → ${message.author.username}`);
+    console.log(`AUTO TIMEOUT → ${message.author.username} | 理由: ${reasons.join(", ")}`);
   }
 });
 
@@ -311,6 +399,11 @@ const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
 // ====================================
 client.once("ready", async () => {
   console.log(`Bot login → ${client.user.tag}`);
+  await sendLog(
+    "✅ Bot起動完了",
+    `**${client.user.tag}** がオンラインになりました`,
+    0x00ff00 // 緑色
+  );
   await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
   console.log("Slash Commands Registered");
 
@@ -356,8 +449,24 @@ client.on("interactionCreate", async (interaction) => {
       await member.timeout(sec * 1000, "管理者による手動timeout");
       console.log("タイムアウト実行完了");
 
+      // タイムアウト後、すぐに全メンバー情報を更新
+      await guild.members.fetch({ force: true }).catch(() => {});
+
+      // 詳細ログを送信
+      await sendLog(
+        "⚖️ 管理者による手動タイムアウト",
+        `**${interaction.user.tag}** が **${user.tag}** をタイムアウトしました`,
+        0xffa500, // オレンジ色
+        [
+          { name: "👤 対象ユーザー", value: `${user.tag} (${user.id})`, inline: false },
+          { name: "👮 実行管理者", value: `${interaction.user.tag} (${interaction.user.id})`, inline: false },
+          { name: "⏱️ タイムアウト期間", value: formatTime(sec), inline: true },
+          { name: "📍 実行チャンネル", value: `<#${interaction.channel.id}>`, inline: true },
+        ]
+      );
+
       await interaction.editReply(`⛔ 管理者が **${user.tag}** を ${sec} 秒 (${formatTime(sec)}) timeout しました`);
-      console.log(`MANUAL TIMEOUT → ${user.tag}`);
+      console.log(`MANUAL TIMEOUT → ${user.tag} by ${interaction.user.tag}`);
     } catch (err) {
       console.log("TOP コマンドエラー:", err.message, err.code);
       await interaction.editReply(`❌ エラーが発生しました: ${err.message}`).catch(() => {
@@ -395,6 +504,7 @@ client.on("interactionCreate", async (interaction) => {
 // ====================================
 client.on("error", (error) => {
   console.log("Discord Client Error:", error.message);
+  sendLog("❌ Bot エラー", error.message, 0xff0000);
 });
 
 process.on("unhandledRejection", (error) => {
