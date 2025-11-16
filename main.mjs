@@ -165,9 +165,9 @@ async function updateRealtimeTimeout() {
     timeoutStatusMessage = await ch.send("⏳ Timeout 中のユーザーを取得中...");
   }
 
-  async function refresh() {
+  setInterval(async () => {
     try {
-      await guild.members.fetch({ force: false }).catch(() => {});
+      await guild.members.fetch({ force: true }).catch(() => {}); // 常に最新情報取得
       const timeoutUsers = guild.members.cache
         .map((m) => ({ member: m, remain: getTimeoutRemaining(m) }))
         .filter((x) => x.remain !== null);
@@ -176,19 +176,15 @@ async function updateRealtimeTimeout() {
         timeoutUsers.length === 0
           ? "⏳ Timeout 中のユーザーはいません"
           : "⏳ **Timeout 中のユーザー一覧（1秒ごと更新）**\n\n" +
-            timeoutUsers.map((u) => `👤 ${u.member.user.tag} ・残り ${u.remain} 秒`).join("\n");
+            timeoutUsers
+              .map((u) => `👤 ${u.member.user.tag} ・残り ${u.remain} 秒`)
+              .join("\n");
 
-      if (timeoutStatusMessage.content !== text) {
-        await timeoutStatusMessage.edit(text);
-      }
+      await timeoutStatusMessage.edit(text).catch(() => {});
     } catch (err) {
       console.log("リアルタイム更新失敗:", err.code || err.message || err);
-    } finally {
-      setTimeout(refresh, 1000);
     }
-  }
-
-  refresh();
+  }, 1000);
 }
 
 // ====================================
@@ -244,11 +240,11 @@ client.once("ready", async () => {
   await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
   console.log("Slash Commands Registered");
 
-  updateRealtimeTimeout(); // 指定チャンネルでリアルタイム更新
+  updateRealtimeTimeout();
 });
 
 // ====================================
-// スラッシュコマンド処理
+// Slash コマンド処理
 // ====================================
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
@@ -257,12 +253,15 @@ client.on("interactionCreate", async (interaction) => {
   await guild.members.fetch({ force: false });
 
   if (interaction.commandName === "top") {
+    // deferReplyで3秒制限回避
+    await interaction.deferReply();
+
     const user = interaction.options.getUser("user");
     const sec = interaction.options.getInteger("seconds");
     const member = await guild.members.fetch(user.id);
     await member.timeout(sec * 1000, "管理者による手動timeout");
 
-    interaction.reply(`⛔ 管理者が **${user.tag}** を ${sec} 秒 timeout しました`);
+    await interaction.editReply(`⛔ 管理者が **${user.tag}** を ${sec} 秒 timeout しました`);
     console.log(`MANUAL TIMEOUT → ${user.tag}`);
     return;
   }
@@ -272,7 +271,8 @@ client.on("interactionCreate", async (interaction) => {
       .map((m) => ({ member: m, remain: getTimeoutRemaining(m) }))
       .filter((x) => x.remain !== null);
 
-    if (timeoutUsers.length === 0) return interaction.reply("✅ timeout 中のユーザーはいません");
+    if (timeoutUsers.length === 0)
+      return interaction.reply("✅ timeout 中のユーザーはいません");
 
     const msg =
       "⏳ **Timeout 中のユーザー一覧**\n\n" +
