@@ -325,7 +325,6 @@ client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
   const guild = interaction.guild;
-  await guild.members.fetch({ force: false });
 
   if (interaction.commandName === "top") {
     try {
@@ -357,20 +356,37 @@ client.on("interactionCreate", async (interaction) => {
   }
 
   if (interaction.commandName === "to") {
-    const timeoutUsers = guild.members.cache
-      .map((m) => ({ member: m, remain: getTimeoutRemaining(m) }))
-      .filter((x) => x.remain !== null)
-      .sort((a, b) => b.remain - a.remain);
+    try {
+      // キャッシュから取得（タイムアウトしないように）
+      const timeoutUsers = guild.members.cache
+        .map((m) => ({ member: m, remain: getTimeoutRemaining(m) }))
+        .filter((x) => x.remain !== null)
+        .sort((a, b) => b.remain - a.remain);
 
-    if (timeoutUsers.length === 0)
-      return interaction.reply("✅ timeout 中のユーザーはいません");
+      if (timeoutUsers.length === 0)
+        return interaction.reply("✅ timeout 中のユーザーはいません");
 
-    const msg =
-      `⏳ **Timeout 中のユーザー一覧** (${timeoutUsers.length}人)\n\n` +
-      timeoutUsers.map((u, i) => `${i + 1}. **${u.member.user.tag}** ・残り ${formatTime(u.remain)}`).join("\n");
+      const msg =
+        `⏳ **Timeout 中のユーザー一覧** (${timeoutUsers.length}人)\n\n` +
+        timeoutUsers.map((u, i) => `${i + 1}. **${u.member.user.tag}** ・残り ${formatTime(u.remain)}`).join("\n");
 
-    interaction.reply(msg);
+      interaction.reply(msg);
+    } catch (err) {
+      console.log("TO コマンドエラー:", err.message);
+      interaction.reply("❌ エラーが発生しました").catch(() => {});
+    }
   }
+});
+
+// ====================================
+// エラーハンドリング
+// ====================================
+client.on("error", (error) => {
+  console.log("Discord Client Error:", error.message);
+});
+
+process.on("unhandledRejection", (error) => {
+  console.log("Unhandled Rejection:", error);
 });
 
 // ====================================
