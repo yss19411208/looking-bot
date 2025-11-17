@@ -65,26 +65,48 @@ let voiceUserAICheck = false;
 
 // レート制限対策
 let lastRequestTime = 0;
-const MIN_REQUEST_INTERVAL = 5000;
+const MIN_REQUEST_INTERVAL = 1000; // 5秒 → 1秒に短縮
 let requestQueue = Promise.resolve();
 
 async function callAPI(apiFunc) {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     requestQueue = requestQueue.then(async () => {
-      while (true) {
+      const maxRetries = 3;
+      let retries = 0;
+      
+      while (retries < maxRetries) {
         try {
           const now = Date.now();
           const diff = now - lastRequestTime;
-          if (diff < MIN_REQUEST_INTERVAL)
+          if (diff < MIN_REQUEST_INTERVAL) {
             await new Promise((r) => setTimeout(r, MIN_REQUEST_INTERVAL - diff));
+          }
 
           lastRequestTime = Date.now();
-          const r = await apiFunc();
+          console.log("API呼び出し実行中...");
+          
+          const r = await Promise.race([
+            apiFunc(),
+            new Promise((_, rej) => setTimeout(() => rej(new Error("API Timeout")), 15000)) // 30秒 → 15秒
+          ]);
+          
+          console.log("API呼び出し成功");
           resolve(r);
           return;
         } catch (err) {
-          if (err.message.includes("429")) await new Promise((r) => setTimeout(r, 3000));
-          else await new Promise((r) => setTimeout(r, 2000));
+          retries++;
+          console.log(`API呼び出しエラー (試行 ${retries}/${maxRetries}):`, err.message);
+          
+          if (err.message.includes("429")) {
+            console.log("レート制限検知 - 2秒待機");
+            await new Promise((r) => setTimeout(r, 2000));
+          } else if (retries >= maxRetries) {
+            console.log("最大リトライ回数に達しました");
+            reject(err);
+            return;
+          } else {
+            await new Promise((r) => setTimeout(r, 1000));
+          }
         }
       }
     });
@@ -117,39 +139,42 @@ async function fetchImageAsBase64(url) {
 // ====================================
 async function checkTextContent(text) {
   try {
-    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+    console.log("=== AI判定開始 ===");
+    console.log("入力テキスト:", text);
+    
+    const model = genAI.getGenerativeModel({ 
+      model: "gemini-2.5-flash",
+      generationConfig: {
+        maxOutputTokens: 100, // 出力を制限して高速化
+        temperature: 0.1, // 一貫性を重視
+      }
+    });
+    
     const prompt = `
-あなたは不適切なメッセージを検出するAIです。以下のメッセージを判定してください。
+不適切なメッセージを検出してください。
 
-【必ず悪質と判定するメッセージ】
-- "死ね" "しね" "殺す" "ころす" などの暴力的な表現
-- "クズ" "ゴミ" "カス" などの侮辱
-- 差別的な発言
-- 脅迫や恐喝
-- 性的な嫌がらせ
+悪質: "死ね" "しね" "殺す" "ころす" "クズ" "ゴミ" "カス" などの暴力・侮辱
+安全: 絵文字、日常会話、質問
 
-【安全と判定するメッセージ】
-- 絵文字のみ
-- 日常会話
-- 質問
-
-重要: 必ず以下の正確なフォーマットで回答してください。他の文章は一切含めないでください。
-
+必ず以下の形式のみで回答:
 判定: 悪質
-理由: 暴力的な表現が含まれている
+理由: 暴力的表現
 
 または
-
 判定: 安全
-理由: 日常会話である
+理由: 日常会話
 
 メッセージ: """${text}"""
     `;
     
-    console.log("=== AI判定開始 ===");
-    console.log("入力テキスト:", text);
+    console.log("Gemini APIに送信中...");
+    const startTime = Date.now();
     
     const result = await callAPI(() => model.generateContent(prompt));
+    
+    const elapsedTime = Date.now() - startTime;
+    console.log(`API応答時間: ${elapsedTime}ms`);
+    
     const rep = result.response.text().trim();
     
     console.log("AIの生の回答:", rep);
@@ -167,7 +192,7 @@ async function checkTextContent(text) {
     console.log(`最終判定: ${isMalicious ? "悪質" : "安全"}`);
     console.log(`理由: ${reason}`);
     
-    // ログチャンネルにも送信
+    // ログチャンネルにも送信（非同期）
     sendLog(
       isMalicious ? "🚨 悪質メッセージ検出" : "✅ 安全メッセージ",
       `メッセージ: \`${text}\``,
@@ -175,14 +200,16 @@ async function checkTextContent(text) {
       [
         { name: "判定結果", value: isMalicious ? "❌ 悪質" : "✅ 安全", inline: true },
         { name: "理由", value: reason, inline: true },
+        { name: "処理時間", value: `${elapsedTime}ms`, inline: true },
         { name: "AIの完全な回答", value: `\`\`\`${rep.substring(0, 1000)}\`\`\``, inline: false },
       ]
     );
     
     return { isMalicious, reason, fullResponse: rep };
   } catch (err) {
-    console.log("AI判定エラー:", err.message);
-    sendLog("❌ AI判定エラー", err.message, 0xff0000);
+    console.log("❌ AI判定エラー:", err.message);
+    console.log("エラー詳細:", err);
+    sendLog("❌ AI判定エラー", `${err.message}\n入力: ${text}`, 0xff0000);
     return { isMalicious: false, reason: "判定エラー", fullResponse: err.message };
   }
 }
@@ -383,9 +410,16 @@ client.on("messageCreate", async (message) => {
 
   // テキスト判定
   if (message.content.trim().length > 0) {
-    console.log(`メッセージ判定開始: "${message.content}"`);
+    console.log(`\n===== メッセージ判定 =====`);
+    console.log(`ユーザー: ${message.author.username}`);
+    console.log(`内容: "${message.content}"`);
+    console.log(`文字数: ${message.content.length}`);
+    
     const result = await checkTextContent(message.content);
-    console.log(`判定結果: ${result.isMalicious ? "悪質" : "安全"} - ${result.reason}`);
+    
+    console.log(`判定完了: ${result.isMalicious ? "⛔ 悪質" : "✅ 安全"}`);
+    console.log(`理由: ${result.reason}`);
+    console.log(`========================\n`);
     
     if (result.isMalicious) {
       malicious = true;
