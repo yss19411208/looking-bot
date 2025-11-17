@@ -115,12 +115,12 @@ async function checkTextContent(text) {
   try {
     const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
     const prompt = `
-以下のメッセージが攻撃的・暴力的・差別的・脅迫的・不快な場合「悪質」と判定理由を答えてください。
-それ以外は「安全」と答えてください。
+以下のメッセージが攻撃的・暴力的・差別的・脅迫的・不快な場合のみ「悪質」と判定してください。
+絵文字のみ、または一般的な日常会話は「安全」と判定してください。
 
-フォーマット:
-判定: [悪質/安全]
-理由: [具体的な理由]
+必ず以下のフォーマットで回答してください：
+判定: [悪質 または 安全]
+理由: [30文字以内の簡潔な理由]
 
 メッセージ:
 ${text}
@@ -128,8 +128,14 @@ ${text}
     const result = await callAPI(() => model.generateContent(prompt));
     const rep = result.response.text().trim();
     
-    const isMalicious = rep.includes("悪質");
-    const reason = rep.split("理由:")[1]?.trim() || "理由不明";
+    const isMalicious = rep.includes("判定: 悪質") || (rep.includes("悪質") && !rep.includes("安全"));
+    
+    // 理由を抽出（30文字以内に制限）
+    let reason = "判定理由不明";
+    const reasonMatch = rep.match(/理由:\s*(.+)/);
+    if (reasonMatch) {
+      reason = reasonMatch[1].trim().substring(0, 50);
+    }
     
     return { isMalicious, reason, fullResponse: rep };
   } catch (err) {
@@ -144,18 +150,24 @@ async function checkImageContent(img) {
   try {
     const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
     const prompt = `
-画像に不適切（暴力・性的・差別など）があれば「悪質」と判定理由を答えてください。
-それ以外は「安全」と答えてください。
+画像に明らかに不適切な内容（暴力・性的・差別など）があれば「悪質」と判定してください。
+一般的な画像や日常的な内容は「安全」と判定してください。
 
-フォーマット:
-判定: [悪質/安全]
-理由: [具体的な理由]
+必ず以下のフォーマットで回答してください：
+判定: [悪質 または 安全]
+理由: [30文字以内の簡潔な理由]
     `;
     const result = await callAPI(() => model.generateContent([prompt, img]));
     const rep = result.response.text().trim();
     
-    const isMalicious = rep.includes("悪質");
-    const reason = rep.split("理由:")[1]?.trim() || "理由不明";
+    const isMalicious = rep.includes("判定: 悪質") || (rep.includes("悪質") && !rep.includes("安全"));
+    
+    // 理由を抽出（30文字以内に制限）
+    let reason = "判定理由不明";
+    const reasonMatch = rep.match(/理由:\s*(.+)/);
+    if (reasonMatch) {
+      reason = reasonMatch[1].trim().substring(0, 50);
+    }
     
     return { isMalicious, reason, fullResponse: rep };
   } catch (err) {
@@ -168,7 +180,8 @@ async function checkImageContent(img) {
 // ====================================
 function getTimeoutRemaining(member) {
   const end = member.communicationDisabledUntilTimestamp ?? 0;
-  const remain = Math.ceil((end - Date.now()) / 1000);
+  const now = Date.now();
+  const remain = Math.ceil((end - now) / 1000);
   return remain > 0 ? remain : null;
 }
 
@@ -239,7 +252,7 @@ async function updateRealtimeTimeout() {
 
         let text;
         if (timeoutUsers.length === 0) {
-          text = "✅ **現在タイムアウト中のユーザーはいません**\n\n最終更新: " + new Date().toLocaleTimeString("ja-JP");
+          text = "✅ **現在タイムアウト中のユーザーはいません**\n\n最終更新: <t:" + Math.floor(Date.now() / 1000) + ":T>";
         } else {
           text = `⏳ **タイムアウト中のユーザー一覧** (${timeoutUsers.length}人)\n\n`;
           text += timeoutUsers
@@ -248,7 +261,7 @@ async function updateRealtimeTimeout() {
               return `${i + 1}. **${u.member.user.tag}**\n   残り: ${formatTime(u.remain)} ${bar}`;
             })
             .join("\n\n");
-          text += "\n\n最終更新: " + new Date().toLocaleTimeString("ja-JP");
+          text += "\n\n最終更新: <t:" + Math.floor(Date.now() / 1000) + ":T>";
         }
 
         // メッセージが存在しない場合は再作成
@@ -354,7 +367,11 @@ client.on("messageCreate", async (message) => {
     // タイムアウト後、メンバー情報を更新
     await message.guild.members.fetch({ force: true }).catch(() => {});
 
-    // 詳細ログを送信
+    // チャンネルに即座に通知
+    message.channel.send(`⛔ **${message.author.username}** を timeout しました (${TIMEOUT_DURATION / 1000 / 60}分)`);
+    console.log(`AUTO TIMEOUT → ${message.author.username} | 理由: ${reasons.join(", ")}`);
+
+    // 詳細ログは非同期でバックグラウンド送信（awaitしない）
     const fields = [
       { name: "👤 対象ユーザー", value: `${message.author.tag} (${message.author.id})`, inline: false },
       { name: "⏱️ タイムアウト期間", value: formatTime(TIMEOUT_DURATION / 1000), inline: true },
@@ -380,15 +397,13 @@ client.on("messageCreate", async (message) => {
       });
     }
 
-    await sendLog(
+    // バックグラウンドで送信
+    sendLog(
       "🔨 自動タイムアウト実行",
       `**${message.author.username}** がAIによって自動的にタイムアウトされました`,
-      0xff0000, // 赤色
+      0xff0000,
       fields
     );
-
-    message.channel.send(`⛔ **${message.author.username}** を timeout しました (${TIMEOUT_DURATION / 1000 / 60}分)`);
-    console.log(`AUTO TIMEOUT → ${message.author.username} | 理由: ${reasons.join(", ")}`);
   }
 });
 
@@ -439,11 +454,9 @@ client.on("interactionCreate", async (interaction) => {
       
       // deferReplyで3秒制限回避
       await interaction.deferReply();
-      console.log("deferReply 完了");
 
       const user = interaction.options.getUser("user");
       const sec = interaction.options.getInteger("seconds");
-      console.log(`対象: ${user.tag}, 秒数: ${sec}`);
 
       // Discordの最大タイムアウト期間は28日（2,419,200秒）
       const MAX_TIMEOUT = 2419200;
@@ -458,19 +471,18 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       const member = await guild.members.fetch(user.id);
-      console.log("メンバー取得完了");
-      
       await member.timeout(sec * 1000, "管理者による手動timeout");
-      console.log("タイムアウト実行完了");
 
-      // タイムアウト後、すぐに全メンバー情報を更新
-      await guild.members.fetch({ force: true }).catch(() => {});
+      // 先に返信（ユーザー体験向上）
+      await interaction.editReply(`⛔ 管理者が **${user.tag}** を ${sec} 秒 (${formatTime(sec)}) timeout しました`);
 
-      // 詳細ログを送信
-      await sendLog(
+      // バックグラウンドで非同期処理（awaitしない）
+      guild.members.fetch({ force: true }).catch(() => {});
+      
+      sendLog(
         "⚖️ 管理者による手動タイムアウト",
         `**${interaction.user.tag}** が **${user.tag}** をタイムアウトしました`,
-        0xffa500, // オレンジ色
+        0xffa500,
         [
           { name: "👤 対象ユーザー", value: `${user.tag} (${user.id})`, inline: false },
           { name: "👮 実行管理者", value: `${interaction.user.tag} (${interaction.user.id})`, inline: false },
@@ -479,7 +491,6 @@ client.on("interactionCreate", async (interaction) => {
         ]
       );
 
-      await interaction.editReply(`⛔ 管理者が **${user.tag}** を ${sec} 秒 (${formatTime(sec)}) timeout しました`);
       console.log(`MANUAL TIMEOUT → ${user.tag} by ${interaction.user.tag}`);
     } catch (err) {
       console.log("TOP コマンドエラー:", err.message, err.code);
