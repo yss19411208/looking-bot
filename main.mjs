@@ -63,6 +63,27 @@ const API_TIMEOUT = 30000;
 // 通話参加者へのAI判定設定
 let voiceUserAICheck = false;
 
+// AI判定の有効/無効
+let aiCheckEnabled = true;
+
+// 簡易キーワードフィルター（AI判定が使えない時のバックアップ）
+const BAD_KEYWORDS = [
+  "死ね", "しね", "殺す", "ころす", "消えろ", "きえろ",
+  "クズ", "くず", "ゴミ", "ごみ", "カス", "かす",
+  "うざい", "ウザイ", "きもい", "キモイ", "気持ち悪い",
+  "バカ", "ばか", "馬鹿", "アホ", "あほ", "阿呆"
+];
+
+function simpleKeywordCheck(text) {
+  const lowerText = text.toLowerCase();
+  for (const keyword of BAD_KEYWORDS) {
+    if (lowerText.includes(keyword)) {
+      return { isMalicious: true, reason: `禁止ワード「${keyword}」を検出` };
+    }
+  }
+  return { isMalicious: false, reason: "禁止ワードなし" };
+}
+
 // レート制限対策
 let lastRequestTime = 0;
 const MIN_REQUEST_INTERVAL = 1000; // 5秒 → 1秒に短縮
@@ -135,26 +156,56 @@ async function fetchImageAsBase64(url) {
 }
 
 // ====================================
-// AI テキスト判定
+// AI テキスト判定（クォータ対策版）
 // ====================================
 async function checkTextContent(text) {
+  // まず簡易キーワードチェック
+  const keywordResult = simpleKeywordCheck(text);
+  
+  if (keywordResult.isMalicious) {
+    console.log("=== キーワードフィルターで検出 ===");
+    console.log("入力テキスト:", text);
+    console.log("判定: 悪質");
+    console.log("理由:", keywordResult.reason);
+    console.log("================================");
+    
+    sendLog(
+      "🚨 キーワードフィルター検出",
+      `メッセージ: \`${text}\``,
+      0xff0000,
+      [
+        { name: "判定結果", value: "❌ 悪質", inline: true },
+        { name: "理由", value: keywordResult.reason, inline: true },
+        { name: "判定方法", value: "キーワードフィルター", inline: true },
+      ]
+    );
+    
+    return keywordResult;
+  }
+  
+  // キーワードで引っかからなければAI判定（クォータがある場合のみ）
+  if (!aiCheckEnabled) {
+    console.log("AI判定は無効化されています（クォータ制限）");
+    return { isMalicious: false, reason: "AI判定スキップ（クォータ制限）" };
+  }
+  
   try {
     console.log("=== AI判定開始 ===");
     console.log("入力テキスト:", text);
     
     const model = genAI.getGenerativeModel({ 
-      model: "gemini-2.5-flash",
+      model: "gemini-2.0-flash-exp", // 無料枠が広いモデルに変更
       generationConfig: {
-        maxOutputTokens: 100, // 出力を制限して高速化
-        temperature: 0.1, // 一貫性を重視
+        maxOutputTokens: 100,
+        temperature: 0.1,
       }
     });
     
     const prompt = `
 不適切なメッセージを検出してください。
 
-悪質: "死ね" "しね" "殺す" "ころす" "クズ" "ゴミ" "カス" などの暴力・侮辱
-安全: 絵文字、日常会話、質問
+悪質: 暴力・侮辱・差別・脅迫
+安全: 日常会話
 
 必ず以下の形式のみで回答:
 判定: 悪質
@@ -182,7 +233,6 @@ async function checkTextContent(text) {
     
     const isMalicious = rep.includes("判定: 悪質");
     
-    // 理由を抽出
     let reason = "判定理由不明";
     const reasonMatch = rep.match(/理由:\s*(.+)/);
     if (reasonMatch) {
@@ -192,24 +242,34 @@ async function checkTextContent(text) {
     console.log(`最終判定: ${isMalicious ? "悪質" : "安全"}`);
     console.log(`理由: ${reason}`);
     
-    // ログチャンネルにも送信（非同期）
     sendLog(
-      isMalicious ? "🚨 悪質メッセージ検出" : "✅ 安全メッセージ",
+      isMalicious ? "🚨 AI判定: 悪質メッセージ検出" : "✅ AI判定: 安全メッセージ",
       `メッセージ: \`${text}\``,
       isMalicious ? 0xff0000 : 0x00ff00,
       [
         { name: "判定結果", value: isMalicious ? "❌ 悪質" : "✅ 安全", inline: true },
         { name: "理由", value: reason, inline: true },
         { name: "処理時間", value: `${elapsedTime}ms`, inline: true },
-        { name: "AIの完全な回答", value: `\`\`\`${rep.substring(0, 1000)}\`\`\``, inline: false },
+        { name: "判定方法", value: "Gemini AI", inline: true },
       ]
     );
     
     return { isMalicious, reason, fullResponse: rep };
   } catch (err) {
     console.log("❌ AI判定エラー:", err.message);
+    
+    // クォータエラーの場合はAI判定を無効化
+    if (err.message.includes("quota") || err.message.includes("429")) {
+      console.log("⚠️ APIクォータ超過 - AI判定を無効化します");
+      aiCheckEnabled = false;
+      sendLog(
+        "⚠️ APIクォータ超過",
+        "AI判定が無効化されました。キーワードフィルターのみで動作します。",
+        0xffa500
+      );
+    }
+    
     console.log("エラー詳細:", err);
-    sendLog("❌ AI判定エラー", `${err.message}\n入力: ${text}`, 0xff0000);
     return { isMalicious: false, reason: "判定エラー", fullResponse: err.message };
   }
 }
