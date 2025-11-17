@@ -24,6 +24,7 @@ const client = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildVoiceStates,
   ],
 });
 
@@ -58,6 +59,9 @@ const genAI = new GoogleGenerativeAI(process.env.AI_TOKEN);
 const WHITELIST_USERS = ["harima1945"];
 const TIMEOUT_DURATION = 30 * 60 * 1000;
 const API_TIMEOUT = 30000;
+
+// 通話参加者へのAI判定設定
+let voiceUserAICheck = false;
 
 // レート制限対策
 let lastRequestTime = 0;
@@ -115,12 +119,28 @@ async function checkTextContent(text) {
   try {
     const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
     const prompt = `
-以下のメッセージが攻撃的・暴力的・差別的・脅迫的・不快な場合のみ「悪質」と判定してください。
-絵文字のみ、または一般的な日常会話は「安全」と判定してください。
+あなたは不適切なメッセージを検出するAIです。以下のメッセージを判定してください。
+
+【悪質と判定する基準】
+- 暴力的な表現（殺す、死ね、など）
+- 差別的な発言
+- 脅迫や恐喝
+- 性的な嫌がらせ
+- 攻撃的な侮辱
+
+【安全と判定する基準】
+- 絵文字のみのメッセージ
+- 日常会話
+- 軽い冗談
 
 必ず以下のフォーマットで回答してください：
-判定: [悪質 または 安全]
-理由: [30文字以内の簡潔な理由]
+判定: 悪質
+理由: [30文字以内の具体的な理由]
+
+または
+
+判定: 安全
+理由: [理由]
 
 メッセージ:
 ${text}
@@ -128,9 +148,11 @@ ${text}
     const result = await callAPI(() => model.generateContent(prompt));
     const rep = result.response.text().trim();
     
-    const isMalicious = rep.includes("判定: 悪質") || (rep.includes("悪質") && !rep.includes("安全"));
+    console.log("AI判定結果:", rep);
     
-    // 理由を抽出（30文字以内に制限）
+    const isMalicious = rep.includes("判定: 悪質");
+    
+    // 理由を抽出
     let reason = "判定理由不明";
     const reasonMatch = rep.match(/理由:\s*(.+)/);
     if (reasonMatch) {
@@ -139,6 +161,7 @@ ${text}
     
     return { isMalicious, reason, fullResponse: rep };
   } catch (err) {
+    console.log("AI判定エラー:", err.message);
     return { isMalicious: false, reason: "判定エラー", fullResponse: err.message };
   }
 }
@@ -160,9 +183,9 @@ async function checkImageContent(img) {
     const result = await callAPI(() => model.generateContent([prompt, img]));
     const rep = result.response.text().trim();
     
-    const isMalicious = rep.includes("判定: 悪質") || (rep.includes("悪質") && !rep.includes("安全"));
+    const isMalicious = rep.includes("判定: 悪質");
     
-    // 理由を抽出（30文字以内に制限）
+    // 理由を抽出
     let reason = "判定理由不明";
     const reasonMatch = rep.match(/理由:\s*(.+)/);
     if (reasonMatch) {
@@ -323,13 +346,26 @@ client.on("messageCreate", async (message) => {
   if (message.author.bot || !message.guild) return;
   if (WHITELIST_USERS.includes(message.author.username)) return;
 
+  // 通話参加者チェック
+  const member = message.guild.members.cache.get(message.author.id);
+  const isInVoice = member?.voice?.channel !== null;
+  
+  // 通話中のユーザーで、voiceUserAICheckがOFFの場合はスキップ
+  if (isInVoice && !voiceUserAICheck) {
+    console.log(`通話中のユーザー ${message.author.username} のメッセージをスキップ (AI判定OFF)`);
+    return;
+  }
+
   let malicious = false;
   let reasons = [];
   let detectedContent = [];
 
   // テキスト判定
   if (message.content.trim().length > 0) {
+    console.log(`メッセージ判定開始: "${message.content}"`);
     const result = await checkTextContent(message.content);
+    console.log(`判定結果: ${result.isMalicious ? "悪質" : "安全"} - ${result.reason}`);
+    
     if (result.isMalicious) {
       malicious = true;
       reasons.push(`📝 テキスト: ${result.reason}`);
@@ -408,9 +444,9 @@ client.on("messageCreate", async (message) => {
 });
 
 // ====================================
-// Slash Commands
+// Slash Commands 定義
 // ====================================
-const commands = [
+const slashCommands = [
   new SlashCommandBuilder()
     .setName("top")
     .setDescription("指定ユーザーを timeout（管理者専用）")
@@ -418,8 +454,24 @@ const commands = [
     .addIntegerOption((o) => o.setName("seconds").setDescription("秒数").setRequired(true))
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
-  new SlashCommandBuilder().setName("to").setDescription("現在 timeout 中のユーザー一覧"),
-];
+  new SlashCommandBuilder()
+    .setName("to")
+    .setDescription("現在 timeout 中のユーザー一覧"),
+
+  new SlashCommandBuilder()
+    .setName("voice-ai")
+    .setDescription("通話参加者へのAI判定設定（管理者専用）")
+    .addStringOption((o) =>
+      o.setName("mode")
+        .setDescription("ON/OFF")
+        .setRequired(true)
+        .addChoices(
+          { name: "ON - 通話中のユーザーもAI判定する", value: "on" },
+          { name: "OFF - 通話中のユーザーはAI判定しない", value: "off" }
+        )
+    )
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+].map(cmd => cmd.toJSON());
 
 const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
 
@@ -431,9 +483,9 @@ client.once("ready", async () => {
   await sendLog(
     "✅ Bot起動完了",
     `**${client.user.tag}** がオンラインになりました`,
-    0x00ff00 // 緑色
+    0x00ff00
   );
-  await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
+  await rest.put(Routes.applicationCommands(client.user.id), { body: slashCommands });
   console.log("Slash Commands Registered");
 
   // リアルタイムタイムアウト表示を開始
@@ -452,13 +504,11 @@ client.on("interactionCreate", async (interaction) => {
     try {
       console.log("TOP コマンド実行開始");
       
-      // deferReplyで3秒制限回避
       await interaction.deferReply();
 
       const user = interaction.options.getUser("user");
       const sec = interaction.options.getInteger("seconds");
 
-      // Discordの最大タイムアウト期間は28日（2,419,200秒）
       const MAX_TIMEOUT = 2419200;
       if (sec > MAX_TIMEOUT) {
         await interaction.editReply(`❌ タイムアウトは最大28日（2,419,200秒）までです。\n指定された秒数: ${sec}秒`);
@@ -473,10 +523,8 @@ client.on("interactionCreate", async (interaction) => {
       const member = await guild.members.fetch(user.id);
       await member.timeout(sec * 1000, "管理者による手動timeout");
 
-      // 先に返信（ユーザー体験向上）
       await interaction.editReply(`⛔ 管理者が **${user.tag}** を ${sec} 秒 (${formatTime(sec)}) timeout しました`);
 
-      // バックグラウンドで非同期処理（awaitしない）
       guild.members.fetch({ force: true }).catch(() => {});
       
       sendLog(
@@ -503,7 +551,6 @@ client.on("interactionCreate", async (interaction) => {
 
   if (interaction.commandName === "to") {
     try {
-      // キャッシュから取得（タイムアウトしないように）
       const timeoutUsers = guild.members.cache
         .map((m) => ({ member: m, remain: getTimeoutRemaining(m) }))
         .filter((x) => x.remain !== null)
@@ -519,6 +566,37 @@ client.on("interactionCreate", async (interaction) => {
       interaction.reply(msg);
     } catch (err) {
       console.log("TO コマンドエラー:", err.message);
+      interaction.reply("❌ エラーが発生しました").catch(() => {});
+    }
+  }
+
+  if (interaction.commandName === "voice-ai") {
+    try {
+      const mode = interaction.options.getString("mode");
+      voiceUserAICheck = mode === "on";
+      
+      const status = voiceUserAICheck ? "✅ **有効**" : "❌ **無効**";
+      const emoji = voiceUserAICheck ? "🔊" : "🔇";
+      
+      sendLog(
+        `${emoji} 通話参加者AI判定設定変更`,
+        `**${interaction.user.tag}** が通話参加者へのAI判定を${voiceUserAICheck ? "有効化" : "無効化"}しました`,
+        voiceUserAICheck ? 0x00ff00 : 0xff0000,
+        [
+          { name: "👮 実行管理者", value: `${interaction.user.tag} (${interaction.user.id})`, inline: false },
+          { name: "⚙️ 新しい設定", value: status, inline: true },
+        ]
+      );
+      
+      interaction.reply({
+        content: `${emoji} 通話参加者へのAI判定を ${status} にしました\n\n` +
+                 `通話中のユーザーのメッセージは${voiceUserAICheck ? "AI判定されます" : "AI判定されません"}`,
+        ephemeral: false
+      });
+      
+      console.log(`VOICE AI CHECK → ${voiceUserAICheck ? "ON" : "OFF"} by ${interaction.user.tag}`);
+    } catch (err) {
+      console.log("VOICE-AI コマンドエラー:", err.message);
       interaction.reply("❌ エラーが発生しました").catch(() => {});
     }
   }
