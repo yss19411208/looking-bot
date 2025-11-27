@@ -66,23 +66,9 @@ let voiceUserAICheck = false;
 // AI判定の有効/無効
 let aiCheckEnabled = true;
 
-// 簡易キーワードフィルター（AI判定が使えない時のバックアップ）
-const BAD_KEYWORDS = [
-  "死ね", "しね", "殺す", "ころす", "消えろ", "きえろ",
-  "クズ", "くず", "ゴミ", "ごみ", "カス", "かす",
-  "うざい", "ウザイ", "きもい", "キモイ", "気持ち悪い",
-  "バカ", "ばか", "馬鹿", "アホ", "あほ", "阿呆"
-];
-
-function simpleKeywordCheck(text) {
-  const lowerText = text.toLowerCase();
-  for (const keyword of BAD_KEYWORDS) {
-    if (lowerText.includes(keyword)) {
-      return { isMalicious: true, reason: `禁止ワード「${keyword}」を検出` };
-    }
-  }
-  return { isMalicious: false, reason: "禁止ワードなし" };
-}
+// AI使用頻度制限（連続して同じユーザーを判定しない）
+const recentChecks = new Map(); // userId -> timestamp
+const AI_CHECK_COOLDOWN = 10000; // 10秒以内は再判定しない
 
 // レート制限対策
 let lastRequestTime = 0;
@@ -156,45 +142,31 @@ async function fetchImageAsBase64(url) {
 }
 
 // ====================================
-// AI テキスト判定（クォータ対策版）
+// AI テキスト判定（使用頻度制限版）
 // ====================================
-async function checkTextContent(text) {
-  // まず簡易キーワードチェック
-  const keywordResult = simpleKeywordCheck(text);
-  
-  if (keywordResult.isMalicious) {
-    console.log("=== キーワードフィルターで検出 ===");
-    console.log("入力テキスト:", text);
-    console.log("判定: 悪質");
-    console.log("理由:", keywordResult.reason);
-    console.log("================================");
-    
-    sendLog(
-      "🚨 キーワードフィルター検出",
-      `メッセージ: \`${text}\``,
-      0xff0000,
-      [
-        { name: "判定結果", value: "❌ 悪質", inline: true },
-        { name: "理由", value: keywordResult.reason, inline: true },
-        { name: "判定方法", value: "キーワードフィルター", inline: true },
-      ]
-    );
-    
-    return keywordResult;
+async function checkTextContent(text, userId) {
+  // AI判定が無効の場合はスキップ
+  if (!aiCheckEnabled) {
+    console.log("⚠️ AI判定は無効化されています（クォータ制限またはコマンドで無効化）");
+    return { isMalicious: false, reason: "AI判定無効", skipped: true };
   }
   
-  // キーワードで引っかからなければAI判定（クォータがある場合のみ）
-  if (!aiCheckEnabled) {
-    console.log("AI判定は無効化されています（クォータ制限）");
-    return { isMalicious: false, reason: "AI判定スキップ（クォータ制限）" };
+  // 同じユーザーの連続判定を制限（API使用量削減）
+  const now = Date.now();
+  const lastCheck = recentChecks.get(userId);
+  if (lastCheck && now - lastCheck < AI_CHECK_COOLDOWN) {
+    const remainingCooldown = Math.ceil((AI_CHECK_COOLDOWN - (now - lastCheck)) / 1000);
+    console.log(`⏳ ユーザー ${userId} はクールダウン中（残り${remainingCooldown}秒）- AI判定スキップ`);
+    return { isMalicious: false, reason: `クールダウン中（${remainingCooldown}秒）`, skipped: true };
   }
   
   try {
     console.log("=== AI判定開始 ===");
     console.log("入力テキスト:", text);
+    console.log("ユーザーID:", userId);
     
     const model = genAI.getGenerativeModel({ 
-      model: "gemini-2.0-flash-exp", // 無料枠が広いモデルに変更
+      model: "gemini-2.0-flash-exp",
       generationConfig: {
         maxOutputTokens: 100,
         temperature: 0.1,
@@ -205,15 +177,15 @@ async function checkTextContent(text) {
 不適切なメッセージを検出してください。
 
 悪質: 暴力・侮辱・差別・脅迫
-安全: 日常会話
+安全: 日常会話・質問・絵文字
 
 必ず以下の形式のみで回答:
 判定: 悪質
-理由: 暴力的表現
+理由: 暴力的表現が含まれている
 
 または
 判定: 安全
-理由: 日常会話
+理由: 日常的な会話である
 
 メッセージ: """${text}"""
     `;
@@ -236,41 +208,45 @@ async function checkTextContent(text) {
     let reason = "判定理由不明";
     const reasonMatch = rep.match(/理由:\s*(.+)/);
     if (reasonMatch) {
-      reason = reasonMatch[1].trim().substring(0, 50);
+      reason = reasonMatch[1].trim().substring(0, 100);
     }
     
     console.log(`最終判定: ${isMalicious ? "悪質" : "安全"}`);
     console.log(`理由: ${reason}`);
     
+    // クールダウン記録
+    recentChecks.set(userId, now);
+    
+    // ログを送信（安全な場合も含む）
     sendLog(
       isMalicious ? "🚨 AI判定: 悪質メッセージ検出" : "✅ AI判定: 安全メッセージ",
       `メッセージ: \`${text}\``,
       isMalicious ? 0xff0000 : 0x00ff00,
       [
         { name: "判定結果", value: isMalicious ? "❌ 悪質" : "✅ 安全", inline: true },
-        { name: "理由", value: reason, inline: true },
+        { name: "理由", value: reason, inline: false },
         { name: "処理時間", value: `${elapsedTime}ms`, inline: true },
-        { name: "判定方法", value: "Gemini AI", inline: true },
+        { name: "ユーザーID", value: userId, inline: true },
+        { name: "AIの回答", value: `\`\`\`${rep.substring(0, 500)}\`\`\``, inline: false },
       ]
     );
     
-    return { isMalicious, reason, fullResponse: rep };
+    return { isMalicious, reason, fullResponse: rep, skipped: false };
   } catch (err) {
     console.log("❌ AI判定エラー:", err.message);
     
     // クォータエラーの場合はAI判定を無効化
     if (err.message.includes("quota") || err.message.includes("429")) {
-      console.log("⚠️ APIクォータ超過 - AI判定を無効化します");
+      console.log("⚠️ APIクォータ超過 - AI判定を一時無効化します");
       aiCheckEnabled = false;
       sendLog(
         "⚠️ APIクォータ超過",
-        "AI判定が無効化されました。キーワードフィルターのみで動作します。",
+        "AI判定が一時的に無効化されました。クォータが回復するまでメッセージ判定は行われません。",
         0xffa500
       );
     }
     
-    console.log("エラー詳細:", err);
-    return { isMalicious: false, reason: "判定エラー", fullResponse: err.message };
+    return { isMalicious: false, reason: "判定エラー", fullResponse: err.message, skipped: true };
   }
 }
 
@@ -379,11 +355,14 @@ async function updateRealtimeTimeout() {
         const timeoutUsers = guild.members.cache
           .map((m) => ({ member: m, remain: getTimeoutRemaining(m) }))
           .filter((x) => x.remain !== null)
-          .sort((a, b) => b.remain - a.remain); // 残り時間が長い順
+          .sort((a, b) => b.remain - a.remain);
+
+        // 現在のUnixタイムスタンプ（秒単位）
+        const currentTimestamp = Math.floor(Date.now() / 1000);
 
         let text;
         if (timeoutUsers.length === 0) {
-          text = "✅ **現在タイムアウト中のユーザーはいません**\n\n最終更新: <t:" + Math.floor(Date.now() / 1000) + ":T>";
+          text = "✅ **現在タイムアウト中のユーザーはいません**\n\n最終更新: <t:" + currentTimestamp + ":T>";
         } else {
           text = `⏳ **タイムアウト中のユーザー一覧** (${timeoutUsers.length}人)\n\n`;
           text += timeoutUsers
@@ -392,7 +371,7 @@ async function updateRealtimeTimeout() {
               return `${i + 1}. **${u.member.user.tag}**\n   残り: ${formatTime(u.remain)} ${bar}`;
             })
             .join("\n\n");
-          text += "\n\n最終更新: <t:" + Math.floor(Date.now() / 1000) + ":T>";
+          text += "\n\n最終更新: <t:" + currentTimestamp + ":T>";
         }
 
         // メッセージが存在しない場合は再作成
@@ -475,7 +454,14 @@ client.on("messageCreate", async (message) => {
     console.log(`内容: "${message.content}"`);
     console.log(`文字数: ${message.content.length}`);
     
-    const result = await checkTextContent(message.content);
+    const result = await checkTextContent(message.content, message.author.id);
+    
+    // スキップされた場合はログに記録して次へ
+    if (result.skipped) {
+      console.log(`⏭️ AI判定スキップ: ${result.reason}`);
+      console.log(`========================\n`);
+      return; // タイムアウトしない
+    }
     
     console.log(`判定完了: ${result.isMalicious ? "⛔ 悪質" : "✅ 安全"}`);
     console.log(`理由: ${result.reason}`);
@@ -583,6 +569,20 @@ const slashCommands = [
         .addChoices(
           { name: "ON - 通話中のユーザーもAI判定する", value: "on" },
           { name: "OFF - 通話中のユーザーはAI判定しない", value: "off" }
+        )
+    )
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+    
+  new SlashCommandBuilder()
+    .setName("ai-mode")
+    .setDescription("AI判定のON/OFF（管理者専用）")
+    .addStringOption((o) =>
+      o.setName("mode")
+        .setDescription("ON/OFF")
+        .setRequired(true)
+        .addChoices(
+          { name: "ON - AI判定を有効化", value: "on" },
+          { name: "OFF - キーワードフィルターのみ", value: "off" }
         )
     )
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
@@ -712,6 +712,39 @@ client.on("interactionCreate", async (interaction) => {
       console.log(`VOICE AI CHECK → ${voiceUserAICheck ? "ON" : "OFF"} by ${interaction.user.tag}`);
     } catch (err) {
       console.log("VOICE-AI コマンドエラー:", err.message);
+      interaction.reply("❌ エラーが発生しました").catch(() => {});
+    }
+  }
+
+  if (interaction.commandName === "ai-mode") {
+    try {
+      const mode = interaction.options.getString("mode");
+      aiCheckEnabled = mode === "on";
+      
+      const status = aiCheckEnabled ? "✅ **AI判定有効**" : "⚠️ **キーワードフィルターのみ**";
+      const emoji = aiCheckEnabled ? "🤖" : "📝";
+      
+      sendLog(
+        `${emoji} AI判定モード変更`,
+        `**${interaction.user.tag}** がAI判定を${aiCheckEnabled ? "有効化" : "無効化"}しました`,
+        aiCheckEnabled ? 0x00ff00 : 0xffa500,
+        [
+          { name: "👮 実行管理者", value: `${interaction.user.tag} (${interaction.user.id})`, inline: false },
+          { name: "⚙️ 新しい設定", value: status, inline: true },
+        ]
+      );
+      
+      interaction.reply({
+        content: `${emoji} AI判定モードを ${status} にしました\n\n` +
+                 (aiCheckEnabled 
+                   ? "キーワードフィルター + AI判定の両方が有効です" 
+                   : "キーワードフィルターのみで動作します（APIクォータ節約）"),
+        ephemeral: false
+      });
+      
+      console.log(`AI MODE → ${aiCheckEnabled ? "ON" : "OFF"} by ${interaction.user.tag}`);
+    } catch (err) {
+      console.log("AI-MODE コマンドエラー:", err.message);
       interaction.reply("❌ エラーが発生しました").catch(() => {});
     }
   }
