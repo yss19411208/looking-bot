@@ -70,6 +70,24 @@ let aiCheckEnabled = true;
 const recentChecks = new Map(); // userId -> timestamp
 const AI_CHECK_COOLDOWN = 10000; // 10秒以内は再判定しない
 
+// キーワードフィルター（AI判定が使えない時のバックアップ）
+const BAD_KEYWORDS = [
+  "死ね", "しね", "殺す", "ころす", "消えろ", "きえろ",
+  "クズ", "くず", "ゴミ", "ごみ", "カス", "かす",
+  "うざい", "ウザイ", "きもい", "キモイ", "気持ち悪い",
+  "バカ", "ばか", "馬鹿", "アホ", "あほ", "阿呆"
+];
+
+function simpleKeywordCheck(text) {
+  const lowerText = text.toLowerCase();
+  for (const keyword of BAD_KEYWORDS) {
+    if (lowerText.includes(keyword)) {
+      return { isMalicious: true, reason: `禁止ワード「${keyword}」を検出` };
+    }
+  }
+  return { isMalicious: false, reason: "禁止ワードなし" };
+}
+
 // レート制限対策
 let lastRequestTime = 0;
 const MIN_REQUEST_INTERVAL = 1000; // 5秒 → 1秒に短縮
@@ -145,10 +163,23 @@ async function fetchImageAsBase64(url) {
 // AI テキスト判定（使用頻度制限版）
 // ====================================
 async function checkTextContent(text, userId) {
-  // AI判定が無効の場合はスキップ
+  // AI判定が無効の場合はキーワードフィルターにフォールバック
   if (!aiCheckEnabled) {
-    console.log("⚠️ AI判定は無効化されています（クォータ制限またはコマンドで無効化）");
-    return { isMalicious: false, reason: "AI判定無効", skipped: true };
+    console.log("⚠️ AI判定は無効化されています - キーワードフィルターを使用");
+    const keywordResult = simpleKeywordCheck(text);
+    
+    sendLog(
+      keywordResult.isMalicious ? "🚨 キーワードフィルター検出" : "✅ キーワードフィルター: 安全",
+      `メッセージ: \`${text}\``,
+      keywordResult.isMalicious ? 0xff0000 : 0x00ff00,
+      [
+        { name: "判定結果", value: keywordResult.isMalicious ? "❌ 悪質" : "✅ 安全", inline: true },
+        { name: "理由", value: keywordResult.reason, inline: false },
+        { name: "判定方法", value: "キーワードフィルター（AIバックアップ）", inline: true },
+      ]
+    );
+    
+    return keywordResult;
   }
   
   // 同じユーザーの連続判定を制限（API使用量削減）
@@ -235,15 +266,18 @@ async function checkTextContent(text, userId) {
   } catch (err) {
     console.log("❌ AI判定エラー:", err.message);
     
-    // クォータエラーの場合はAI判定を無効化
+    // クォータエラーの場合はAI判定を無効化してキーワードフィルターにフォールバック
     if (err.message.includes("quota") || err.message.includes("429")) {
-      console.log("⚠️ APIクォータ超過 - AI判定を一時無効化します");
+      console.log("⚠️ APIクォータ超過 - キーワードフィルターにフォールバック");
       aiCheckEnabled = false;
       sendLog(
         "⚠️ APIクォータ超過",
-        "AI判定が一時的に無効化されました。クォータが回復するまでメッセージ判定は行われません。",
+        "AI判定が一時的に無効化されました。キーワードフィルターで動作します。",
         0xffa500
       );
+      
+      // キーワードフィルターで再判定
+      return simpleKeywordCheck(text);
     }
     
     return { isMalicious: false, reason: "判定エラー", fullResponse: err.message, skipped: true };
@@ -737,8 +771,8 @@ client.on("interactionCreate", async (interaction) => {
       interaction.reply({
         content: `${emoji} AI判定モードを ${status} にしました\n\n` +
                  (aiCheckEnabled 
-                   ? "キーワードフィルター + AI判定の両方が有効です" 
-                   : "キーワードフィルターのみで動作します（APIクォータ節約）"),
+                   ? "Gemini AIで判定します（高精度）" 
+                   : "キーワードフィルターで動作します（APIクォータ節約）"),
         ephemeral: false
       });
       
