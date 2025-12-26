@@ -125,11 +125,13 @@ let lastRequestTime = 0;
 const MIN_REQUEST_INTERVAL = 1000;
 let requestQueue = Promise.resolve();
 
+// callAPI: 指数バックオフと429/クォータ検出を含む
 async function callAPI(apiFunc) {
   return new Promise((resolve, reject) => {
     requestQueue = requestQueue.then(async () => {
-      const maxRetries = 3;
+      const maxRetries = 5;
       let retries = 0;
+      let backoff = 1000;
 
       while (retries < maxRetries) {
         try {
@@ -152,20 +154,34 @@ async function callAPI(apiFunc) {
           return;
         } catch (err) {
           retries++;
-          console.log(`API呼び出しエラー (試行 ${retries}/${maxRetries}):`, err.message);
+          const msg = err && err.message ? err.message : String(err);
+          console.log(`API呼び出しエラー (試行 ${retries}/${maxRetries}):`, msg);
 
-          if (err.message && err.message.includes("429")) {
-            console.log("レート制限検知 - 2秒待機");
-            await new Promise((r) => setTimeout(r, 2000));
+          // 429 または Too Many Requests の場合は指数バックオフ
+          if (msg.includes("429") || msg.toLowerCase().includes("too many requests")) {
+            console.log("レート制限検知 - 指数バックオフ", backoff);
+            await new Promise((r) => setTimeout(r, backoff));
+            backoff = Math.min(backoff * 2, 30000);
+
+            // ある程度続く場合は上位で処理を切り替えられるようにエラーを返す
+            if (retries >= 3) {
+              const e = new Error("Rate limit persistent");
+              e.code = 429;
+              return reject(e);
+            }
+          } else if (msg.toLowerCase().includes("quota") || msg.toLowerCase().includes("quotaexceeded")) {
+            // クォータ超過は即座に失敗扱い
+            const e = new Error("Quota exceeded");
+            e.code = 403;
+            return reject(e);
           } else if (retries >= maxRetries) {
-            console.log("最大リトライ回数に達しました");
-            reject(err);
-            return;
+            return reject(err);
           } else {
             await new Promise((r) => setTimeout(r, 1000));
           }
         }
       }
+      reject(new Error("API call failed after retries"));
     });
   });
 }
@@ -292,21 +308,18 @@ async function checkTextContent(text, userId) {
 
     return { isMalicious, reason, fullResponse: rep, skipped: false };
   } catch (err) {
-    console.log("❌ AI判定エラー:", err.message);
+    const msg = err && err.message ? err.message : String(err);
+    console.log("❌ AI判定エラー:", msg);
 
-    if (err.message && (err.message.includes("quota") || err.message.includes("429"))) {
-      console.log("⚠️ APIクォータ超過 - キーワードフィルターにフォールバック");
+    // 429 や Rate limit persistent を検出したら AI を一時無効化してログ通知
+    if (err.code === 429 || msg.toLowerCase().includes("rate limit") || msg.toLowerCase().includes("quota")) {
       aiCheckEnabled = false;
-      sendLog(
-        "⚠️ APIクォータ超過",
-        "AI判定が一時的に無効化されました。キーワードフィルターで動作します。",
-        0xffa500
-      );
-
+      sendLog("⚠️ AI API レート/クォータ問題", "AI 判定を一時無効化しました。クォータと請求を確認してください。", 0xffa500);
       return simpleKeywordCheck(text);
     }
 
-    return { isMalicious: false, reason: "判定エラー", fullResponse: err.message, skipped: true };
+    // その他はキーワード判定にフォールバック
+    return simpleKeywordCheck(text);
   }
 }
 
@@ -371,6 +384,12 @@ let timeoutStatusMessage = null;
 let updateInterval = null;
 const TIMEOUT_STATUS_CHANNEL = process.env.TIMEOUT_CHANNEL;
 
+// 大規模サーバー対策: フェッチ間隔とバックオフ設定
+const FULL_FETCH_INTERVAL = 60000; // 60秒（必要に応じて延長）
+let lastFullFetch = 0;
+let fetchBackoff = 2000; // 初回バックオフ 2秒
+const MAX_FETCH_BACKOFF = 60000; // 最大 60秒
+
 async function ensureTimeoutStatusMessage(ch) {
   const savedId = loadStatusMessageId();
   if (savedId) {
@@ -412,25 +431,36 @@ async function updateRealtimeTimeout() {
     console.log("✅ リアルタイムタイムアウト表示を開始しました (messageId:", timeoutStatusMessage.id, ")");
 
     let lastEditTime = 0;
-    let lastFullFetch = 0;
     let editQueue = Promise.resolve();
-
-    const FULL_FETCH_INTERVAL = 15000;
 
     updateInterval = setInterval(async () => {
       try {
         const now = Date.now();
 
+        // フェッチは頻繁に行わない。成功時にバックオフをリセット、失敗時は指数的に待機
         if (now - lastFullFetch > FULL_FETCH_INTERVAL) {
           try {
-            await guild.members.fetch({ force: true });
+            // withPresences: false で軽めに試す
+            await guild.members.fetch({ withPresences: false }).catch(() => null);
+            lastFullFetch = now;
+            fetchBackoff = 2000; // 成功したらバックオフをリセット
           } catch (e) {
             console.log("guild.members.fetch error:", e.code || e.message);
-            await new Promise(r => setTimeout(r, 2000));
+
+            // タイムアウト系のエラーを検出してバックオフを伸ばす
+            if (e.name === "GuildMembersTimeout" || (e.message && e.message.includes("GuildMembersTimeout"))) {
+              console.log("GuildMembersTimeout を検出しました。バックオフを適用します:", fetchBackoff);
+              await new Promise(r => setTimeout(r, fetchBackoff));
+              fetchBackoff = Math.min(fetchBackoff * 2, MAX_FETCH_BACKOFF);
+              // lastFullFetch は更新しない（次ループで再試行）
+            } else {
+              // その他のエラーは短く待って次回に
+              await new Promise(r => setTimeout(r, 2000));
+            }
           }
-          lastFullFetch = now;
         }
 
+        // タイムアウト中のユーザーをキャッシュから取得（全件フェッチが失敗してもキャッシュで表示）
         const timeoutUsers = guild.members.cache
           .map((m) => ({ member: m, remain: getTimeoutRemaining(m) }))
           .filter((x) => x.remain !== null)
@@ -842,7 +872,6 @@ process.on("SIGTERM", async () => {
   console.log("SIGTERM received: shutting down gracefully");
   try {
     if (updateInterval) clearInterval(updateInterval);
-    // 保存処理などがあればここで行う
     await sendLog("⚠️ Bot 停止", "プロセスが停止シグナルを受け取りました", 0xffa500);
   } catch (e) {
     console.log("shutdown error:", e && e.message);
