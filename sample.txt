@@ -1,6 +1,4 @@
 // main.mjs
-import fs from "fs";
-import path from "path";
 import {
   Client,
   GatewayIntentBits,
@@ -16,36 +14,6 @@ import express from "express";
 import fetch from "node-fetch";
 
 dotenv.config();
-
-// ====================================
-// 設定と永続化
-// ====================================
-const STATUS_STORE = path.resolve(process.cwd(), "timeoutStatus.json");
-function saveStatusMessageId(id) {
-  try {
-    fs.writeFileSync(STATUS_STORE, JSON.stringify({ messageId: id }), "utf8");
-  } catch (e) {
-    console.log("status save error:", e.message);
-  }
-}
-function loadStatusMessageId() {
-  try {
-    if (!fs.existsSync(STATUS_STORE)) return null;
-    const raw = fs.readFileSync(STATUS_STORE, "utf8");
-    const obj = JSON.parse(raw || "{}");
-    return obj.messageId || null;
-  } catch (e) {
-    console.log("status load error:", e.message);
-    return null;
-  }
-}
-function clearStatusMessageId() {
-  try {
-    if (fs.existsSync(STATUS_STORE)) fs.unlinkSync(STATUS_STORE);
-  } catch (e) {
-    console.log("status clear error:", e.message);
-  }
-}
 
 // ====================================
 // Discord クライアント
@@ -67,7 +35,7 @@ async function sendLog(title, description, color = 0x00ff00, fields = []) {
   const chId = process.env.CHANNEL_ID;
   if (!client.isReady() || !chId) return;
 
-  const ch = client.channels.cache.get(chId) || await client.channels.fetch(chId).catch(() => null);
+  const ch = client.channels.cache.get(chId);
   if (!ch || !ch.send) return;
 
   const embed = new EmbedBuilder()
@@ -122,7 +90,7 @@ function simpleKeywordCheck(text) {
 
 // レート制限対策
 let lastRequestTime = 0;
-const MIN_REQUEST_INTERVAL = 1000;
+const MIN_REQUEST_INTERVAL = 1000; // 5秒 → 1秒に短縮
 let requestQueue = Promise.resolve();
 
 async function callAPI(apiFunc) {
@@ -130,7 +98,7 @@ async function callAPI(apiFunc) {
     requestQueue = requestQueue.then(async () => {
       const maxRetries = 3;
       let retries = 0;
-
+      
       while (retries < maxRetries) {
         try {
           const now = Date.now();
@@ -141,20 +109,20 @@ async function callAPI(apiFunc) {
 
           lastRequestTime = Date.now();
           console.log("API呼び出し実行中...");
-
+          
           const r = await Promise.race([
             apiFunc(),
-            new Promise((_, rej) => setTimeout(() => rej(new Error("API Timeout")), 15000))
+            new Promise((_, rej) => setTimeout(() => rej(new Error("API Timeout")), 15000)) // 30秒 → 15秒
           ]);
-
+          
           console.log("API呼び出し成功");
           resolve(r);
           return;
         } catch (err) {
           retries++;
           console.log(`API呼び出しエラー (試行 ${retries}/${maxRetries}):`, err.message);
-
-          if (err.message && err.message.includes("429")) {
+          
+          if (err.message.includes("429")) {
             console.log("レート制限検知 - 2秒待機");
             await new Promise((r) => setTimeout(r, 2000));
           } else if (retries >= maxRetries) {
@@ -195,10 +163,11 @@ async function fetchImageAsBase64(url) {
 // AI テキスト判定（使用頻度制限版）
 // ====================================
 async function checkTextContent(text, userId) {
+  // AI判定が無効の場合はキーワードフィルターにフォールバック
   if (!aiCheckEnabled) {
     console.log("⚠️ AI判定は無効化されています - キーワードフィルターを使用");
     const keywordResult = simpleKeywordCheck(text);
-
+    
     sendLog(
       keywordResult.isMalicious ? "🚨 キーワードフィルター検出" : "✅ キーワードフィルター: 安全",
       `メッセージ: \`${text}\``,
@@ -209,10 +178,11 @@ async function checkTextContent(text, userId) {
         { name: "判定方法", value: "キーワードフィルター（AIバックアップ）", inline: true },
       ]
     );
-
+    
     return keywordResult;
   }
-
+  
+  // 同じユーザーの連続判定を制限（API使用量削減）
   const now = Date.now();
   const lastCheck = recentChecks.get(userId);
   if (lastCheck && now - lastCheck < AI_CHECK_COOLDOWN) {
@@ -220,20 +190,20 @@ async function checkTextContent(text, userId) {
     console.log(`⏳ ユーザー ${userId} はクールダウン中（残り${remainingCooldown}秒）- AI判定スキップ`);
     return { isMalicious: false, reason: `クールダウン中（${remainingCooldown}秒）`, skipped: true };
   }
-
+  
   try {
     console.log("=== AI判定開始 ===");
     console.log("入力テキスト:", text);
     console.log("ユーザーID:", userId);
-
-    const model = genAI.getGenerativeModel({
+    
+    const model = genAI.getGenerativeModel({ 
       model: "gemini-2.0-flash-exp",
       generationConfig: {
         maxOutputTokens: 100,
         temperature: 0.1,
       }
     });
-
+    
     const prompt = `
 不適切なメッセージを検出してください。
 
@@ -250,33 +220,35 @@ async function checkTextContent(text, userId) {
 
 メッセージ: """${text}"""
     `;
-
+    
     console.log("Gemini APIに送信中...");
     const startTime = Date.now();
-
+    
     const result = await callAPI(() => model.generateContent(prompt));
-
+    
     const elapsedTime = Date.now() - startTime;
     console.log(`API応答時間: ${elapsedTime}ms`);
-
+    
     const rep = result.response.text().trim();
-
+    
     console.log("AIの生の回答:", rep);
     console.log("================");
-
+    
     const isMalicious = rep.includes("判定: 悪質");
-
+    
     let reason = "判定理由不明";
     const reasonMatch = rep.match(/理由:\s*(.+)/);
     if (reasonMatch) {
       reason = reasonMatch[1].trim().substring(0, 100);
     }
-
+    
     console.log(`最終判定: ${isMalicious ? "悪質" : "安全"}`);
     console.log(`理由: ${reason}`);
-
+    
+    // クールダウン記録
     recentChecks.set(userId, now);
-
+    
+    // ログを送信（安全な場合も含む）
     sendLog(
       isMalicious ? "🚨 AI判定: 悪質メッセージ検出" : "✅ AI判定: 安全メッセージ",
       `メッセージ: \`${text}\``,
@@ -289,12 +261,13 @@ async function checkTextContent(text, userId) {
         { name: "AIの回答", value: `\`\`\`${rep.substring(0, 500)}\`\`\``, inline: false },
       ]
     );
-
+    
     return { isMalicious, reason, fullResponse: rep, skipped: false };
   } catch (err) {
     console.log("❌ AI判定エラー:", err.message);
-
-    if (err.message && (err.message.includes("quota") || err.message.includes("429"))) {
+    
+    // クォータエラーの場合はAI判定を無効化してキーワードフィルターにフォールバック
+    if (err.message.includes("quota") || err.message.includes("429")) {
       console.log("⚠️ APIクォータ超過 - キーワードフィルターにフォールバック");
       aiCheckEnabled = false;
       sendLog(
@@ -302,10 +275,11 @@ async function checkTextContent(text, userId) {
         "AI判定が一時的に無効化されました。キーワードフィルターで動作します。",
         0xffa500
       );
-
+      
+      // キーワードフィルターで再判定
       return simpleKeywordCheck(text);
     }
-
+    
     return { isMalicious: false, reason: "判定エラー", fullResponse: err.message, skipped: true };
   }
 }
@@ -326,15 +300,16 @@ async function checkImageContent(img) {
     `;
     const result = await callAPI(() => model.generateContent([prompt, img]));
     const rep = result.response.text().trim();
-
+    
     const isMalicious = rep.includes("判定: 悪質");
-
+    
+    // 理由を抽出
     let reason = "判定理由不明";
     const reasonMatch = rep.match(/理由:\s*(.+)/);
     if (reasonMatch) {
       reason = reasonMatch[1].trim().substring(0, 50);
     }
-
+    
     return { isMalicious, reason, fullResponse: rep };
   } catch (err) {
     return { isMalicious: false, reason: "判定エラー", fullResponse: err.message };
@@ -358,35 +333,18 @@ function formatTime(seconds) {
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
   const s = seconds % 60;
-
+  
   if (h > 0) return `${h}時間${m}分${s}秒`;
   if (m > 0) return `${m}分${s}秒`;
   return `${s}秒`;
 }
 
 // ====================================
-// リアルタイム Timeout 更新（永続化対応）
+// リアルタイム Timeout 更新（指定チャンネル）
 // ====================================
 let timeoutStatusMessage = null;
 let updateInterval = null;
 const TIMEOUT_STATUS_CHANNEL = process.env.TIMEOUT_CHANNEL;
-
-async function ensureTimeoutStatusMessage(ch) {
-  const savedId = loadStatusMessageId();
-  if (savedId) {
-    try {
-      const msg = await ch.messages.fetch(savedId).catch(() => null);
-      if (msg) return msg;
-      clearStatusMessageId();
-    } catch (e) {
-      console.log("メッセージ復元エラー:", e.message);
-    }
-  }
-
-  const newMsg = await ch.send("⏳ **Timeout 監視を開始します...**");
-  saveStatusMessageId(newMsg.id);
-  return newMsg;
-}
 
 async function updateRealtimeTimeout() {
   if (!TIMEOUT_STATUS_CHANNEL) {
@@ -403,39 +361,37 @@ async function updateRealtimeTimeout() {
 
     const guild = ch.guild;
 
-    if (updateInterval) {
-      clearInterval(updateInterval);
-      updateInterval = null;
+    // 初回メッセージ送信
+    if (!timeoutStatusMessage) {
+      timeoutStatusMessage = await ch.send("⏳ **Timeout 監視を開始します...**");
+      console.log("✅ リアルタイムタイムアウト表示を開始しました");
     }
 
-    timeoutStatusMessage = await ensureTimeoutStatusMessage(ch);
-    console.log("✅ リアルタイムタイムアウト表示を開始しました (messageId:", timeoutStatusMessage.id, ")");
+    // 既存のインターバルをクリア
+    if (updateInterval) clearInterval(updateInterval);
 
     let lastEditTime = 0;
     let lastFullFetch = 0;
     let editQueue = Promise.resolve();
-
-    const FULL_FETCH_INTERVAL = 15000;
-
+    
+    // 1秒ごとに更新
     updateInterval = setInterval(async () => {
       try {
         const now = Date.now();
-
-        if (now - lastFullFetch > FULL_FETCH_INTERVAL) {
-          try {
-            await guild.members.fetch({ force: true });
-          } catch (e) {
-            console.log("guild.members.fetch error:", e.code || e.message);
-            await new Promise(r => setTimeout(r, 2000));
-          }
+        
+        // 5秒ごとにメンバー情報を強制更新
+        if (now - lastFullFetch > 5000) {
+          await guild.members.fetch({ force: true }).catch(() => {});
           lastFullFetch = now;
         }
-
+        
+        // タイムアウト中のユーザーを取得
         const timeoutUsers = guild.members.cache
           .map((m) => ({ member: m, remain: getTimeoutRemaining(m) }))
           .filter((x) => x.remain !== null)
           .sort((a, b) => b.remain - a.remain);
 
+        // 現在のUnixタイムスタンプ（秒単位）
         const currentTimestamp = Math.floor(Date.now() / 1000);
 
         let text;
@@ -452,38 +408,47 @@ async function updateRealtimeTimeout() {
           text += "\n\n最終更新: <t:" + currentTimestamp + ":T>";
         }
 
+        // メッセージが存在しない場合は再作成
         if (!timeoutStatusMessage) {
-          console.log("⚠️ メッセージがnullのため再作成します");
-          timeoutStatusMessage = await ensureTimeoutStatusMessage(ch);
+          console.log("⚠️ メッセージが削除されたため再作成します");
+          clearInterval(updateInterval);
+          updateRealtimeTimeout();
+          return;
         }
 
-        if (timeoutStatusMessage && timeoutStatusMessage.content !== text) {
+        // メッセージを編集（変更がある場合のみ、キューで制御）
+        if (timeoutStatusMessage.content !== text) {
           editQueue = editQueue.then(async () => {
-            if (!timeoutStatusMessage) return;
-
-            const timeSinceLastEdit = Date.now() - lastEditTime;
-            if (timeSinceLastEdit < 700) {
-              await new Promise(r => setTimeout(r, 700 - timeSinceLastEdit));
+            // 編集前に再度nullチェック
+            if (!timeoutStatusMessage) {
+              console.log("⚠️ 編集時にメッセージがnullです");
+              return;
             }
 
+            const timeSinceLastEdit = Date.now() - lastEditTime;
+            // レート制限対策：最低500ms空ける
+            if (timeSinceLastEdit < 500) {
+              await new Promise(r => setTimeout(r, 500 - timeSinceLastEdit));
+            }
+            
             try {
               await timeoutStatusMessage.edit(text);
               lastEditTime = Date.now();
             } catch (err) {
-              console.log("メッセージ編集エラー:", err.code || err.message);
-              if (err.code === 10008 || (err.message && err.message.includes("Unknown Message"))) {
+              console.log("メッセージ編集エラー:", err.message);
+              // メッセージが削除された場合は再作成
+              if (err.code === 10008 || err.message.includes("Unknown Message")) {
                 timeoutStatusMessage = null;
-                clearStatusMessageId();
-              } else if (err.code === 50013) {
-                console.log("権限エラー: Botにメッセージ編集権限があるか確認してください");
-              } else if (err.code === 429) {
+                clearInterval(updateInterval);
+                updateRealtimeTimeout();
+              }
+              // レート制限エラーの場合は少し待つ
+              if (err.code === 429) {
                 console.log("⚠️ レート制限検知 - 5秒待機");
                 await new Promise(r => setTimeout(r, 5000));
-              } else {
-                console.log("編集失敗詳細:", err);
               }
             }
-          }).catch(e => console.log("editQueue error:", e.message));
+          });
         }
       } catch (err) {
         console.log("リアルタイム更新失敗:", err.code || err.message);
@@ -499,112 +464,117 @@ async function updateRealtimeTimeout() {
 // メッセージ監視
 // ====================================
 client.on("messageCreate", async (message) => {
-  try {
-    if (message.author.bot || !message.guild) return;
-    if (WHITELIST_USERS.includes(message.author.username)) return;
+  if (message.author.bot || !message.guild) return;
+  if (WHITELIST_USERS.includes(message.author.username)) return;
 
-    const member = message.guild.members.cache.get(message.author.id);
-    const isInVoice = member?.voice?.channel !== null;
+  // 通話参加者チェック
+  const member = message.guild.members.cache.get(message.author.id);
+  const isInVoice = member?.voice?.channel !== null;
+  
+  // 通話中のユーザーで、voiceUserAICheckがOFFの場合はスキップ
+  if (isInVoice && !voiceUserAICheck) {
+    console.log(`通話中のユーザー ${message.author.username} のメッセージをスキップ (AI判定OFF)`);
+    return;
+  }
 
-    if (isInVoice && !voiceUserAICheck) {
-      console.log(`通話中のユーザー ${message.author.username} のメッセージをスキップ (AI判定OFF)`);
-      return;
-    }
+  let malicious = false;
+  let reasons = [];
+  let detectedContent = [];
 
-    let malicious = false;
-    let reasons = [];
-    let detectedContent = [];
-
-    if (message.content.trim().length > 0) {
-      console.log(`\n===== メッセージ判定 =====`);
-      console.log(`ユーザー: ${message.author.username}`);
-      console.log(`内容: "${message.content}"`);
-      console.log(`文字数: ${message.content.length}`);
-
-      const result = await checkTextContent(message.content, message.author.id);
-
-      if (result.skipped) {
-        console.log(`⏭️ AI判定スキップ: ${result.reason}`);
-        console.log(`========================\n`);
-        return;
-      }
-
-      console.log(`判定完了: ${result.isMalicious ? "⛔ 悪質" : "✅ 安全"}`);
-      console.log(`理由: ${result.reason}`);
+  // テキスト判定
+  if (message.content.trim().length > 0) {
+    console.log(`\n===== メッセージ判定 =====`);
+    console.log(`ユーザー: ${message.author.username}`);
+    console.log(`内容: "${message.content}"`);
+    console.log(`文字数: ${message.content.length}`);
+    
+    const result = await checkTextContent(message.content, message.author.id);
+    
+    // スキップされた場合はログに記録して次へ
+    if (result.skipped) {
+      console.log(`⏭️ AI判定スキップ: ${result.reason}`);
       console.log(`========================\n`);
+      return; // タイムアウトしない
+    }
+    
+    console.log(`判定完了: ${result.isMalicious ? "⛔ 悪質" : "✅ 安全"}`);
+    console.log(`理由: ${result.reason}`);
+    console.log(`========================\n`);
+    
+    if (result.isMalicious) {
+      malicious = true;
+      reasons.push(`📝 テキスト: ${result.reason}`);
+      detectedContent.push({
+        type: "テキスト",
+        content: message.content.substring(0, 100) + (message.content.length > 100 ? "..." : ""),
+        reason: result.reason,
+      });
+    }
+  }
 
+  // 画像判定
+  for (const a of message.attachments.values()) {
+    if (!a.contentType?.startsWith("image/")) continue;
+
+    const img = await fetchImageAsBase64(a.url);
+    if (img) {
+      const result = await checkImageContent(img);
       if (result.isMalicious) {
         malicious = true;
-        reasons.push(`📝 テキスト: ${result.reason}`);
+        reasons.push(`🖼️ 画像: ${result.reason}`);
         detectedContent.push({
-          type: "テキスト",
-          content: message.content.substring(0, 100) + (message.content.length > 100 ? "..." : ""),
+          type: "画像",
+          content: a.url,
           reason: result.reason,
         });
       }
     }
+  }
 
-    for (const a of message.attachments.values()) {
-      if (!a.contentType?.startsWith("image/")) continue;
+  if (malicious) {
+    const member = await message.guild.members.fetch(message.author.id);
+    await member.timeout(TIMEOUT_DURATION);
 
-      const img = await fetchImageAsBase64(a.url);
-      if (img) {
-        const result = await checkImageContent(img);
-        if (result.isMalicious) {
-          malicious = true;
-          reasons.push(`🖼️ 画像: ${result.reason}`);
-          detectedContent.push({
-            type: "画像",
-            content: a.url,
-            reason: result.reason,
+    // タイムアウト後、メンバー情報を更新
+    await message.guild.members.fetch({ force: true }).catch(() => {});
+
+    // チャンネルに即座に通知
+    message.channel.send(`⛔ **${message.author.username}** を timeout しました (${TIMEOUT_DURATION / 1000 / 60}分)`);
+    console.log(`AUTO TIMEOUT → ${message.author.username} | 理由: ${reasons.join(", ")}`);
+
+    // 詳細ログは非同期でバックグラウンド送信（awaitしない）
+    const fields = [
+      { name: "👤 対象ユーザー", value: `${message.author.tag} (${message.author.id})`, inline: false },
+      { name: "⏱️ タイムアウト期間", value: formatTime(TIMEOUT_DURATION / 1000), inline: true },
+      { name: "📍 チャンネル", value: `<#${message.channel.id}>`, inline: true },
+      { name: "🚨 検出理由", value: reasons.join("\n"), inline: false },
+    ];
+
+    if (detectedContent.length > 0) {
+      detectedContent.forEach((item, i) => {
+        if (item.type === "テキスト") {
+          fields.push({
+            name: `📝 検出内容 ${i + 1}`,
+            value: `\`\`\`${item.content}\`\`\`\n理由: ${item.reason}`,
+            inline: false,
+          });
+        } else if (item.type === "画像") {
+          fields.push({
+            name: `🖼️ 検出内容 ${i + 1}`,
+            value: `[画像リンク](${item.content})\n理由: ${item.reason}`,
+            inline: false,
           });
         }
-      }
+      });
     }
 
-    if (malicious) {
-      const member = await message.guild.members.fetch(message.author.id);
-      await member.timeout(TIMEOUT_DURATION);
-
-      await message.guild.members.fetch({ force: true }).catch(() => {});
-
-      message.channel.send(`⛔ **${message.author.username}** を timeout しました (${TIMEOUT_DURATION / 1000 / 60}分)`);
-      console.log(`AUTO TIMEOUT → ${message.author.username} | 理由: ${reasons.join(", ")}`);
-
-      const fields = [
-        { name: "👤 対象ユーザー", value: `${message.author.tag} (${message.author.id})`, inline: false },
-        { name: "⏱️ タイムアウト期間", value: formatTime(TIMEOUT_DURATION / 1000), inline: true },
-        { name: "📍 チャンネル", value: `<#${message.channel.id}>`, inline: true },
-        { name: "🚨 検出理由", value: reasons.join("\n"), inline: false },
-      ];
-
-      if (detectedContent.length > 0) {
-        detectedContent.forEach((item, i) => {
-          if (item.type === "テキスト") {
-            fields.push({
-              name: `📝 検出内容 ${i + 1}`,
-              value: `\`\`\`${item.content}\`\`\`\n理由: ${item.reason}`,
-              inline: false,
-            });
-          } else if (item.type === "画像") {
-            fields.push({
-              name: `🖼️ 検出内容 ${i + 1}`,
-              value: `[画像リンク](${item.content})\n理由: ${item.reason}`,
-              inline: false,
-            });
-          }
-        });
-      }
-
-      sendLog(
-        "🔨 自動タイムアウト実行",
-        `**${message.author.username}** がAIによって自動的にタイムアウトされました`,
-        0xff0000,
-        fields
-      );
-    }
-  } catch (err) {
-    console.log("messageCreate handler error:", err && (err.stack || err.message));
+    // バックグラウンドで送信
+    sendLog(
+      "🔨 自動タイムアウト実行",
+      `**${message.author.username}** がAIによって自動的にタイムアウトされました`,
+      0xff0000,
+      fields
+    );
   }
 });
 
@@ -636,7 +606,7 @@ const slashCommands = [
         )
     )
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
-
+    
   new SlashCommandBuilder()
     .setName("ai-mode")
     .setDescription("AI判定のON/OFF（管理者専用）")
@@ -664,17 +634,11 @@ client.once("ready", async () => {
     `**${client.user.tag}** がオンラインになりました`,
     0x00ff00
   );
-  try {
-    await rest.put(Routes.applicationCommands(client.user.id), { body: slashCommands });
-    console.log("Slash Commands Registered");
-  } catch (e) {
-    console.log("Slash command register error:", e && e.message);
-  }
+  await rest.put(Routes.applicationCommands(client.user.id), { body: slashCommands });
+  console.log("Slash Commands Registered");
 
-  // 一度だけ開始（多重起動防止）
-  setTimeout(() => {
-    if (!updateInterval) updateRealtimeTimeout();
-  }, 2000);
+  // リアルタイムタイムアウト表示を開始
+  setTimeout(() => updateRealtimeTimeout(), 2000);
 });
 
 // ====================================
@@ -688,7 +652,7 @@ client.on("interactionCreate", async (interaction) => {
   if (interaction.commandName === "top") {
     try {
       console.log("TOP コマンド実行開始");
-
+      
       await interaction.deferReply();
 
       const user = interaction.options.getUser("user");
@@ -711,7 +675,7 @@ client.on("interactionCreate", async (interaction) => {
       await interaction.editReply(`⛔ 管理者が **${user.tag}** を ${sec} 秒 (${formatTime(sec)}) timeout しました`);
 
       guild.members.fetch({ force: true }).catch(() => {});
-
+      
       sendLog(
         "⚖️ 管理者による手動タイムアウト",
         `**${interaction.user.tag}** が **${user.tag}** をタイムアウトしました`,
@@ -726,7 +690,7 @@ client.on("interactionCreate", async (interaction) => {
 
       console.log(`MANUAL TIMEOUT → ${user.tag} by ${interaction.user.tag}`);
     } catch (err) {
-      console.log("TOP コマンドエラー:", err && (err.message || err));
+      console.log("TOP コマンドエラー:", err.message, err.code);
       await interaction.editReply(`❌ エラーが発生しました: ${err.message}`).catch(() => {
         interaction.reply(`❌ エラーが発生しました: ${err.message}`).catch(() => {});
       });
@@ -759,10 +723,10 @@ client.on("interactionCreate", async (interaction) => {
     try {
       const mode = interaction.options.getString("mode");
       voiceUserAICheck = mode === "on";
-
+      
       const status = voiceUserAICheck ? "✅ **有効**" : "❌ **無効**";
       const emoji = voiceUserAICheck ? "🔊" : "🔇";
-
+      
       sendLog(
         `${emoji} 通話参加者AI判定設定変更`,
         `**${interaction.user.tag}** が通話参加者へのAI判定を${voiceUserAICheck ? "有効化" : "無効化"}しました`,
@@ -772,13 +736,13 @@ client.on("interactionCreate", async (interaction) => {
           { name: "⚙️ 新しい設定", value: status, inline: true },
         ]
       );
-
+      
       interaction.reply({
         content: `${emoji} 通話参加者へのAI判定を ${status} にしました\n\n` +
                  `通話中のユーザーのメッセージは${voiceUserAICheck ? "AI判定されます" : "AI判定されません"}`,
         ephemeral: false
       });
-
+      
       console.log(`VOICE AI CHECK → ${voiceUserAICheck ? "ON" : "OFF"} by ${interaction.user.tag}`);
     } catch (err) {
       console.log("VOICE-AI コマンドエラー:", err.message);
@@ -790,10 +754,10 @@ client.on("interactionCreate", async (interaction) => {
     try {
       const mode = interaction.options.getString("mode");
       aiCheckEnabled = mode === "on";
-
+      
       const status = aiCheckEnabled ? "✅ **AI判定有効**" : "⚠️ **キーワードフィルターのみ**";
       const emoji = aiCheckEnabled ? "🤖" : "📝";
-
+      
       sendLog(
         `${emoji} AI判定モード変更`,
         `**${interaction.user.tag}** がAI判定を${aiCheckEnabled ? "有効化" : "無効化"}しました`,
@@ -803,15 +767,15 @@ client.on("interactionCreate", async (interaction) => {
           { name: "⚙️ 新しい設定", value: status, inline: true },
         ]
       );
-
+      
       interaction.reply({
         content: `${emoji} AI判定モードを ${status} にしました\n\n` +
-                 (aiCheckEnabled
-                   ? "Gemini AIで判定します（高精度）"
+                 (aiCheckEnabled 
+                   ? "Gemini AIで判定します（高精度）" 
                    : "キーワードフィルターで動作します（APIクォータ節約）"),
         ephemeral: false
       });
-
+      
       console.log(`AI MODE → ${aiCheckEnabled ? "ON" : "OFF"} by ${interaction.user.tag}`);
     } catch (err) {
       console.log("AI-MODE コマンドエラー:", err.message);
@@ -824,40 +788,19 @@ client.on("interactionCreate", async (interaction) => {
 // エラーハンドリング
 // ====================================
 client.on("error", (error) => {
-  console.log("Discord Client Error:", error && (error.message || error));
-  sendLog("❌ Bot エラー", error && (error.message || String(error)), 0xff0000);
+  console.log("Discord Client Error:", error.message);
+  sendLog("❌ Bot エラー", error.message, 0xff0000);
 });
 
 process.on("unhandledRejection", (error) => {
-  console.log("Unhandled Rejection:", error && (error.stack || error));
-});
-
-process.on("uncaughtException", (err) => {
-  console.log("Uncaught Exception:", err && (err.stack || err));
-  // Render はプロセスを再起動するため、ここではログを残すのみ
-});
-
-// Graceful shutdown for Render
-process.on("SIGTERM", async () => {
-  console.log("SIGTERM received: shutting down gracefully");
-  try {
-    if (updateInterval) clearInterval(updateInterval);
-    // 保存処理などがあればここで行う
-    await sendLog("⚠️ Bot 停止", "プロセスが停止シグナルを受け取りました", 0xffa500);
-  } catch (e) {
-    console.log("shutdown error:", e && e.message);
-  } finally {
-    process.exit(0);
-  }
+  console.log("Unhandled Rejection:", error);
 });
 
 // ====================================
 // Bot 起動
 // ====================================
 console.log("Discord 接続中…");
-client.login(process.env.DISCORD_TOKEN).catch((e) => {
-  console.log("Discord login failed:", e && e.message);
-});
+client.login(process.env.DISCORD_TOKEN);
 
 // ====================================
 // Web サーバー（Render対策）
@@ -867,6 +810,4 @@ const port = process.env.PORT || 3000;
 app.get("/", (req, res) => {
   res.json({ status: "Bot is running!", uptime: process.uptime(), now: new Date().toISOString() });
 });
-app.listen(port, () => {
-  console.log(`Web server listening on port ${port}`);
-});
+app.listen(port, () => console.log(`Web OK : ${port}`));
